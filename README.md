@@ -22,14 +22,24 @@ in a `.env` file.
 
 ## Is this worth running?
 
-Not for money. A whole M1 Max does roughly 0.9 GH/s; the Bitcoin network does
-around a trillion times that. Mining solo, you would expect to find a block
-about once every twenty million years, and the electricity will cost more than
-any pool payout. The dashboard shows your live odds so there is no confusion.
+As an investment, no. As a lottery ticket, absolutely.
 
-It is a lottery ticket and a working, readable example of a GPU miner. Every
-hash is a real attempt at the current block, and if one ever lands, the reward
-goes to your address.
+The honest maths: an M1 Max does roughly 0.9 GH/s, and the Bitcoin network does
+about a trillion times that. On average you'd find a block about once every
+twenty million years, and the electricity will cost more than you can expect to
+earn. The dashboard shows your live odds, so nothing is hidden.
+
+But averages aren't destiny. Every block is a fresh draw, and every one of your
+hashes is a genuine attempt at it — the same lottery the giant mining farms are
+playing, just with fewer tickets. Solo miners running tiny hobby rigs *do*
+occasionally hit a block, and when it happens the entire block reward (several
+BTC plus fees, minus the pool's small cut) goes straight to your address. No
+splitting it with a pool, no sign-ups, no account.
+
+So leave it running while you work, watch your best share creep upward, and
+know that somewhere in those billions of hashes a second there's a tiny chance
+of something life-changing. Worst case, you get a fast, readable GPU miner to
+poke at and learn from.
 
 ## Requirements
 
