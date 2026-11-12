@@ -1,4 +1,8 @@
-# bitcoin_miner
+<p align="center">
+  <img src="assets/bitcoin.svg" width="160" alt="Pixel-art Bitcoin logo">
+</p>
+
+<h1 align="center">Metal Lottery Ticket</h1>
 
 A Bitcoin miner for Apple Silicon GPUs, written in Rust. It hashes on the GPU
 through Metal, shows a live terminal dashboard, and is configured with one line
