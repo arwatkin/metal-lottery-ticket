@@ -4,7 +4,7 @@ A Bitcoin miner for Apple Silicon GPUs, written in Rust. It hashes on the GPU
 through Metal, shows a live terminal dashboard, and is configured with one line
 in a `.env` file.
 
-![The live terminal dashboard](assets/dashboard.png)
+![The live terminal dashboard](dashboard.png)
 
 ## Is this worth running?
 
