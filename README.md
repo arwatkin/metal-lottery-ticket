@@ -32,7 +32,7 @@ earn. The dashboard shows your live odds, so nothing is hidden.
 But averages aren't destiny. Every block is a fresh draw, and every one of your
 hashes is a genuine attempt at it — the same lottery the giant mining farms are
 playing, just with fewer tickets. Solo miners running tiny hobby rigs *do*
-occasionally hit a block, and when it happens the entire block reward (several
+occasionally hit a block, and when it happens the entire block reward (3.125
 BTC plus fees, minus the pool's small cut) goes straight to your address. No
 splitting it with a pool, no sign-ups, no account.
 
