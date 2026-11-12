@@ -1,7 +1,5 @@
 <h1 align="center">Metal Lottery Ticket</h1>
 
-<p align="center"><b>Solo-mine Bitcoin on your Mac's GPU. The odds are terrible. The dream is free.</b></p>
-
 A Bitcoin miner for Apple Silicon GPUs, written in Rust. It hashes on the GPU
 through Metal, shows a live terminal dashboard, and is configured with one line
 in a `.env` file.
