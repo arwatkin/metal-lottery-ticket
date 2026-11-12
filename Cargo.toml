@@ -1,0 +1,29 @@
+[package]
+name = "bitcoin_miner"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+description = "A Bitcoin miner for Apple Silicon GPUs (Metal) with a ratatui terminal dashboard"
+license = "MIT"
+readme = "README.md"
+keywords = ["bitcoin", "mining", "metal", "apple-silicon", "tui"]
+categories = ["command-line-utilities", "cryptography::cryptocurrencies"]
+
+[dependencies]
+anyhow = "1"
+dotenvy = "0.15"
+hex = "0.4"
+libc = "0.2.191"
+ratatui = "0.30"
+serde_json = "1"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6"
+objc2-foundation = "0.3"
+objc2-metal = "0.3"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+strip = true
