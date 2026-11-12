@@ -1,28 +1,10 @@
-<p align="center">
-  <img src="assets/bitcoin.svg" width="160" alt="Pixel-art Bitcoin logo">
-</p>
-
 <h1 align="center">Metal Lottery Ticket</h1>
 
 A Bitcoin miner for Apple Silicon GPUs, written in Rust. It hashes on the GPU
 through Metal, shows a live terminal dashboard, and is configured with one line
 in a `.env` file.
 
-```
- ₿  bitcoin_miner v0.1.0   Apple M1 Max                                        ● MINING   up 01:02:05
-╭ Hashrate ────────────────────────────────────╮╭ History ─────────────────────────────────────────╮
-│                                              ││1.1 GH/s  │                                       │
-│ ██████  ██████  ██████      ██  ██           ││          │⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉⠉│
-│ ██  ██      ██      ██      ██  ██           ││          │                                       │
-│ ██████  ██████  ██████      ██████           ││534.7 MH/s│                                       │
-│     ██  ██          ██          ██           ││          │                                       │
-│ ██████  ██████  ██████  ██      ██  MH/s     ││          │                                       │
-│ average 918.2 MH/s  ·  intensity 100%        ││0         │                                       │
-╰──────────────────────────────────────────────╯╰──────────────────────────────────────────────────╯
-╭ Pool ─────────────────╮╭ Block ────────────────╮╭ Shares ───────────────╮╭ Lottery ──────────────╮
-│ Server   solo.ckpool… ││ Height     923,456    ││ Accepted   17         ││ Network    1.1 ZH/s   │
-│ Status   MINING       ││ Difficulty 150.00T    ││ Rejected   0          ││ Per block  1 in 1.2 … │
-```
+![The live terminal dashboard](assets/dashboard.png)
 
 ## Is this worth running?
 
