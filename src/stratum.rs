@@ -294,8 +294,9 @@ fn response(shared: &Shared, client: &Client, state: &mut Session, message: &Val
                 format!("Authorized as {}", shared.config.username()),
             );
 
-            // Ask for a difficulty this GPU can meet every few seconds. Pools
-            // are free to ignore the request or clamp it to their minimum.
+            // Ask for a difficulty this GPU can meet about once every
+            // SHARE_INTERVAL_SECS. Pools are free to ignore the request or
+            // clamp it to their minimum.
             let hashrate = shared.benchmark.load(Ordering::Relaxed) as f64;
             let suggested = (hashrate * SHARE_INTERVAL_SECS / 4_294_967_296.0).max(1.0);
             client.send(&json!({
