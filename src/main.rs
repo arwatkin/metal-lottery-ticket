@@ -53,6 +53,7 @@ CONFIGURATION (.env file or environment):
 
 KEYS:
     q / Esc   quit        p / Space   pause or resume
+    Ctrl-L    redraw the screen
 "
 );
 

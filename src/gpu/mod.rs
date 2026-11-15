@@ -7,7 +7,7 @@
 pub mod kernel;
 
 use anyhow::{Context, Result, anyhow, bail};
-use objc2::rc::Retained;
+use objc2::rc::{Retained, autoreleasepool};
 use objc2::runtime::ProtocolObject;
 use objc2_foundation::NSString;
 use objc2_metal::{
@@ -165,6 +165,33 @@ impl<T> Gpu<T> {
                 .store(0, Ordering::Relaxed);
         }
 
+        // Metal hands back autoreleased objects (the compute encoder, at least).
+        // The miner thread has no run loop to drain them, so without a pool of
+        // our own every dispatch leaks one: millions over a long run, until
+        // malloc runs out of address space.
+        let command = match autoreleasepool(|_| self.encode(&slot, rows)) {
+            Ok(command) => command,
+            Err(error) => {
+                self.free.push(slot);
+                return Err(error);
+            }
+        };
+
+        self.in_flight.push_back(InFlight {
+            slot,
+            command,
+            hashes: rows as u64 * HASHES_PER_ROW,
+            tag,
+        });
+        Ok(())
+    }
+
+    /// Encodes and commits one dispatch reading and writing `slot`.
+    fn encode(
+        &self,
+        slot: &Slot,
+        rows: u32,
+    ) -> Result<Retained<ProtocolObject<dyn MTLCommandBuffer>>> {
         let command = self
             .queue
             .commandBuffer()
@@ -193,14 +220,7 @@ impl<T> Gpu<T> {
         );
         encoder.endEncoding();
         command.commit();
-
-        self.in_flight.push_back(InFlight {
-            slot,
-            command,
-            hashes: rows as u64 * HASHES_PER_ROW,
-            tag,
-        });
-        Ok(())
+        Ok(command)
     }
 
     /// Blocks until the oldest queued dispatch finishes and returns its result.
@@ -208,13 +228,16 @@ impl<T> Gpu<T> {
         let Some(job) = self.in_flight.pop_front() else {
             return Ok(None);
         };
-        job.command.waitUntilCompleted();
-        if job.command.status() == MTLCommandBufferStatus::Error {
-            let reason = job
-                .command
-                .error()
-                .map(|e| e.localizedDescription().to_string())
-                .unwrap_or_else(|| "unknown error".into());
+        let failure = autoreleasepool(|_| {
+            job.command.waitUntilCompleted();
+            (job.command.status() == MTLCommandBufferStatus::Error).then(|| {
+                job.command
+                    .error()
+                    .map(|e| e.localizedDescription().to_string())
+                    .unwrap_or_else(|| "unknown error".into())
+            })
+        });
+        if let Some(reason) = failure {
             self.free.push(job.slot);
             bail!("GPU dispatch failed: {reason}");
         }

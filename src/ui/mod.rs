@@ -12,7 +12,10 @@ use ratatui::symbols::Marker;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Axis, Block, BorderType, Chart, Dataset, GraphType, Padding, Paragraph};
 use std::collections::VecDeque;
-use std::sync::atomic::Ordering;
+use std::io::BufRead;
+use std::os::fd::FromRawFd;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicI32, Ordering};
 use std::time::{Duration, Instant};
 
 const ORANGE: Color = Color::Rgb(247, 147, 26);
@@ -114,8 +117,9 @@ impl View {
 }
 
 /// Runs the full-screen dashboard until the user quits or the miner stops.
-pub fn run(shared: &Shared) -> Result<()> {
+pub fn run(shared: &Arc<Shared>) -> Result<()> {
     let mut terminal = ratatui::init();
+    let capture = StderrCapture::start(shared);
     let result = (|| -> Result<()> {
         let mut meter = RateMeter::new(RATE_WINDOW);
         let mut history: VecDeque<f64> = VecDeque::with_capacity(HISTORY_SECONDS);
@@ -144,14 +148,102 @@ pub fn run(shared: &Shared) -> Result<()> {
                     KeyCode::Char('p') | KeyCode::Char(' ') => {
                         shared.paused.fetch_xor(true, Ordering::Relaxed);
                     }
+                    KeyCode::Char('l') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        terminal.clear()?;
+                    }
                     _ => {}
                 }
             }
         }
         Ok(())
     })();
+    drop(capture);
     ratatui::restore();
     result
+}
+
+/// The real stderr, saved while [`StderrCapture`] is active; -1 otherwise.
+static SAVED_STDERR: AtomicI32 = AtomicI32::new(-1);
+
+/// Routes stderr into the log panel while the dashboard owns the screen.
+///
+/// macOS libraries (malloc, Metal) write warnings straight to file descriptor
+/// 2. On the dashboard those bytes land wherever the cursor happens to be and
+/// stay there, because ratatui only redraws cells it believes have changed.
+struct StderrCapture {
+    saved: libc::c_int,
+}
+
+impl StderrCapture {
+    fn start(shared: &Arc<Shared>) -> Option<Self> {
+        let mut fds = [0; 2];
+        // SAFETY: plain descriptor juggling; every fd we create is either
+        // handed to `File` (which owns it), kept in `saved`, or closed here.
+        let saved = unsafe {
+            if libc::pipe(fds.as_mut_ptr()) != 0 {
+                return None;
+            }
+            let saved = libc::dup(libc::STDERR_FILENO);
+            if saved < 0 || libc::dup2(fds[1], libc::STDERR_FILENO) < 0 {
+                for fd in [fds[0], fds[1], saved] {
+                    if fd >= 0 {
+                        libc::close(fd);
+                    }
+                }
+                return None;
+            }
+            libc::close(fds[1]);
+            saved
+        };
+        SAVED_STDERR.store(saved, Ordering::SeqCst);
+
+        // A panic must reach the real terminal, not the log panel that is
+        // about to disappear. This hook runs before ratatui's, which restores
+        // the screen and then prints the panic message.
+        let previous = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            let saved = SAVED_STDERR.load(Ordering::SeqCst);
+            if saved >= 0 {
+                // SAFETY: `saved` is open for as long as it is published.
+                unsafe { libc::dup2(saved, libc::STDERR_FILENO) };
+            }
+            previous(info);
+        }));
+
+        // SAFETY: `fds[0]` is the pipe's read end and nothing else owns it.
+        let reader = unsafe { std::fs::File::from_raw_fd(fds[0]) };
+        let shared = shared.clone();
+        let spawned = std::thread::Builder::new()
+            .name("stderr".into())
+            .spawn(move || {
+                let mut reader = std::io::BufReader::new(reader);
+                let mut line = Vec::new();
+                // Ends when the last write end closes, i.e. when stderr is
+                // restored in `drop`.
+                while reader.read_until(b'\n', &mut line).is_ok_and(|n| n > 0) {
+                    let text = String::from_utf8_lossy(&line);
+                    let text = text.trim();
+                    if !text.is_empty() {
+                        shared.log(Level::Warn, text);
+                    }
+                    line.clear();
+                }
+            });
+        let capture = Self { saved };
+        // Without a reader the pipe would fill up and block every writer.
+        spawned.is_ok().then_some(capture)
+    }
+}
+
+impl Drop for StderrCapture {
+    fn drop(&mut self) {
+        SAVED_STDERR.store(-1, Ordering::SeqCst);
+        // SAFETY: `saved` is the descriptor `start` duplicated from stderr.
+        unsafe {
+            libc::dup2(self.saved, libc::STDERR_FILENO);
+            libc::close(self.saved);
+        }
+    }
 }
 
 /// Runs without a dashboard: log lines plus a periodic one-line summary.

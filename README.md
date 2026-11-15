@@ -42,7 +42,7 @@ cp .env.example .env        # then put your address in BTC_ADDRESS
 cargo run --release
 ```
 
-Press `q` to quit and `p` to pause or resume.
+Press `q` to quit, `p` to pause or resume, and `Ctrl-L` to redraw the screen.
 
 To see what your GPU can do without connecting to anything:
 
