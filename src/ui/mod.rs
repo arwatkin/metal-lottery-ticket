@@ -605,10 +605,18 @@ fn draw_panels(frame: &mut Frame, area: Rect, view: &View, wide: bool) {
         let seconds = j.network_difficulty * 4_294_967_296.0 / rate;
         (seconds, j.network_difficulty * 4_294_967_296.0 / 600.0)
     });
-    let found_style = if view.blocks_found > 0 {
-        Style::new().fg(Color::Black).bg(GREEN).bold()
+    let found = if view.blocks_found > 0 {
+        // A green badge with a space either side. The leading space sits in
+        // the label's padding so the number stays in the value column.
+        Line::from(vec![
+            Span::styled(format!("{:<10}", "Found"), Style::new().fg(DIM)),
+            Span::styled(
+                format!(" {} ", view.blocks_found),
+                Style::new().fg(Color::Black).bg(GREEN).bold(),
+            ),
+        ])
     } else {
-        Style::new()
+        row("Found", view.blocks_found.to_string())
     };
     let lottery = vec![
         row(
@@ -631,10 +639,7 @@ fn draw_panels(frame: &mut Frame, area: Rect, view: &View, wide: bool) {
             "Expected",
             odds.map_or(dash(), |(s, _)| format::span(s).into()),
         ),
-        row(
-            "Found",
-            Span::styled(format!(" {} ", view.blocks_found), found_style),
-        ),
+        found,
     ];
     frame.render_widget(Paragraph::new(lottery).block(panel("Lottery")), cells[3]);
 }
@@ -773,6 +778,30 @@ mod tests {
         println!("{screen}");
         for needle in ["923.4 MH/s", "Accepted", "Expected", "Log line number 11"] {
             assert!(screen.contains(needle), "missing {needle:?}");
+        }
+    }
+
+    #[test]
+    fn found_count_lines_up_with_other_values() {
+        let mut view = sample_view();
+        for blocks in [0, 3] {
+            view.blocks_found = blocks;
+            let screen = render(140, 40, &view);
+            // Every value starts 11 columns after its label.
+            let value_at = |label: &str| {
+                let line: Vec<char> = screen
+                    .lines()
+                    .find(|line| line.contains(label))
+                    .unwrap()
+                    .chars()
+                    .collect();
+                let start = (0..line.len())
+                    .find(|&i| line[i..].starts_with(&label.chars().collect::<Vec<_>>()))
+                    .unwrap();
+                (line[start + 10], line[start + 11])
+            };
+            assert_ne!(value_at("Expected").1, ' ');
+            assert_eq!(value_at("Found"), (' ', char::from(b'0' + blocks as u8)));
         }
     }
 
