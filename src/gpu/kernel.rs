@@ -30,6 +30,10 @@
 //! * **Early exit** - a valid share needs the last state word of the final hash
 //!   to be zero. That word is `IV[7] + e` where `e` is produced by round 60, so
 //!   rounds 61-63 and the final feed-forward additions are never computed.
+//! * **Uniform constants** - the kernel is limited by instruction issue, and a
+//!   32-bit literal costs an extra instruction to materialise. Round constants
+//!   added to message words are read from the parameter buffer instead, which
+//!   the GPU holds in uniform registers that instructions use directly (+2%).
 //!
 //! Each GPU thread computes a single hash: on Apple GPUs that measured faster
 //! than giving a thread several independent hashes (more live registers halve
@@ -154,6 +158,7 @@ struct Params {{
     uint pad;
     uint mid_b[8]; // Kernel::Pair, odd lanes: the rolled header version
     uint pre_b[8];
+    uint kc[64];   // the SHA-256 round constants K
 }};
 
 struct Results {{
@@ -253,8 +258,11 @@ kernel void {entry}(constant Params& p [[buffer(0)]],
             schedule(s, 'w', i);
         }
     }
+    // Round constants added to a variable word come from the `kc` table: the
+    // GPU keeps it in uniform registers that instructions read directly,
+    // whereas a 32-bit literal costs an extra instruction to materialise.
     for r in 16..64 {
-        round(s, r, &format!("0x{:08x}u + w{r}", K[r]));
+        round(s, r, &format!("p.kc[{r}] + w{r}"));
     }
 
     // Feed-forward: the first hash becomes message words x0..x7 of block 3.
@@ -267,6 +275,9 @@ kernel void {entry}(constant Params& p [[buffer(0)]],
     for (i, name) in vars(0).iter().enumerate() {
         writeln!(s, "    {name} = 0x{:08x}u;", IV[i]).unwrap();
     }
+    // The state is still mostly the constant IV here, so literal K values
+    // let the compiler fold them into that arithmetic (measured faster than
+    // reading `p.kc`).
     for r in 0..8 {
         round(s, r, &format!("0x{:08x}u + x{r}", K[r]));
     }
@@ -299,7 +310,7 @@ kernel void {entry}(constant Params& p [[buffer(0)]],
         schedule(s, 'x', i);
     }
     for r in 16..60 {
-        round(s, r, &format!("0x{:08x}u + x{r}", K[r]));
+        round(s, r, &format!("p.kc[{r}] + x{r}"));
     }
 
     // Round 60 produces the `e` that ends up as the last word of the hash.
@@ -307,7 +318,7 @@ kernel void {entry}(constant Params& p [[buffer(0)]],
     let [_, _, _, d, e, f, g, h] = vars(60);
     write!(
         s,
-        r#"    const uint last = {d} + {h} + S1({e}) + CH({e}, {f}, {g}) + 0x{k60:08x}u + x60;
+        r#"    const uint last = {d} + {h} + S1({e}) + CH({e}, {f}, {g}) + p.kc[60] + x60;
     if (last == 0x{target:08x}u) {{
         const uint slot = atomic_fetch_add_explicit(&results.count, 1u, memory_order_relaxed);
         if (slot < {max_results}u) {{
@@ -317,7 +328,6 @@ kernel void {entry}(constant Params& p [[buffer(0)]],
     }}
 }}
 "#,
-        k60 = K[60],
         target = 0u32.wrapping_sub(IV[7]),
         max_results = MAX_RESULTS,
         lane = if pair { "odd ? 1u : 0u" } else { "0u" },

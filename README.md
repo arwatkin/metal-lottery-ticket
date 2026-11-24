@@ -142,6 +142,10 @@ compressions (192 rounds); the kernel computes about 121 of them:
 - **Early exit.** A hash can only meet difficulty 1 if its last 32-bit word is
   zero, and that word is fixed four rounds before the end, so the final three
   rounds are never computed.
+- **Constants in uniform registers.** The GPU is limited by how many
+  instructions it can issue, and a 32-bit literal costs an extra instruction to
+  load. The round constants are passed in the parameter buffer instead, which
+  the GPU keeps in registers every instruction can read for free.
 - **Paired lanes.** If the pool allows version rolling (BIP 310/320, which most
   pools do), neighbouring GPU threads hash the same nonce under two header
   versions. The version only affects the first block, so both threads need the
@@ -161,7 +165,7 @@ mining starts.
 
 | Machine              | Single lane | Paired lanes |
 | -------------------- | ----------- | ------------ |
-| M1 Max (32-core GPU) | ~920 MH/s   | ~960 MH/s    |
+| M1 Max (32-core GPU) | ~945 MH/s   | ~990 MH/s    |
 
 Numbers for other chips are welcome — run `--benchmark` and open a pull request.
 

@@ -235,6 +235,10 @@ pub fn kernel_params(header: &[u8; 80]) -> KernelParams {
         pad: 0,
         mid_b: [0; 8],
         pre_b: [0; 8],
+        kc: [
+            K[..32].try_into().expect("32 words"),
+            K[32..].try_into().expect("32 words"),
+        ],
     }
 }
 

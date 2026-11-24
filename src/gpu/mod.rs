@@ -50,6 +50,10 @@ pub struct KernelParams {
     /// (version-rolled) header, hashed by the odd lanes.
     pub mid_b: [u32; 8],
     pub pre_b: [u32; 8],
+    /// The SHA-256 round constants. Read through the parameter buffer they
+    /// sit in uniform registers, which saves an instruction per use compared
+    /// with literals. Two halves because `Default` stops at 32-element arrays.
+    pub kc: [[u32; 32]; 2],
 }
 
 #[repr(C)]
