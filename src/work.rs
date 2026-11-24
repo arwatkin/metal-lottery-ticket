@@ -1,6 +1,6 @@
 //! Turning pool jobs into block headers, targets and GPU work units.
 
-use crate::gpu::KernelParams;
+use crate::gpu::{GROUP_SHIFT, GROUP_SIZE, GroupVersions, KernelParams};
 use crate::sha256::{self, IV, K, big_sigma0, big_sigma1, ch, maj, small_sigma0, small_sigma1};
 
 /// The Bitcoin genesis block header - used as a known-answer test.
@@ -171,6 +171,54 @@ impl Job {
 /// submit, so shares are valid on any pool.
 pub fn rolled_version(version: u32, mask: u32) -> Option<u32> {
     (mask != 0 && version & mask == 0).then(|| version | (mask & mask.wrapping_neg()))
+}
+
+/// Version-bit masks for [`crate::gpu::Kernel::Group`] (`GROUP_SIZE` distinct
+/// versions), or `None` if `mask` has fewer than `GROUP_SHIFT` rollable bits
+/// or overlaps `version`.
+///
+/// Lane `0` always has mask `0` (the original header version); lane `i` sets
+/// the subset of the lowest `GROUP_SHIFT` mask bits selected by `i`.
+pub fn rolled_group_bits(version: u32, mask: u32) -> Option<[u32; GROUP_SIZE]> {
+    if version & mask != 0 || mask.count_ones() < GROUP_SHIFT {
+        return None;
+    }
+    let mut bit_masks = [0u32; GROUP_SHIFT as usize];
+    let mut rem = mask;
+    for slot in &mut bit_masks {
+        let low = rem & rem.wrapping_neg();
+        *slot = low;
+        rem &= rem - 1;
+    }
+    Some(std::array::from_fn(|idx| {
+        let mut bits = 0u32;
+        for (j, &bm) in bit_masks.iter().enumerate() {
+            if (idx >> j) & 1 != 0 {
+                bits |= bm;
+            }
+        }
+        bits
+    }))
+}
+
+/// Precomputes the `GROUP_SIZE` midstates and round-3 states for
+/// [`crate::gpu::Kernel::Group`]. All versions share Block 2's constants in
+/// `kernel_params(header)`.
+pub fn kernel_group_versions(
+    header: &[u8; 80],
+    version_bits: &[u32; GROUP_SIZE],
+) -> Box<GroupVersions> {
+    let base_version = u32::from_le_bytes(header[0..4].try_into().unwrap());
+    let mut out = Box::new(GroupVersions::default());
+    for (lane, &bits) in version_bits.iter().enumerate() {
+        let h = with_version(header, base_version | bits);
+        let p = kernel_params(&h);
+        for word in 0..8 {
+            out.mid[word][lane] = p.mid[word];
+            out.pre[word][lane] = p.pre[word];
+        }
+    }
+    out
 }
 
 /// Returns `header` with its version field replaced.
@@ -375,6 +423,37 @@ mod tests {
             (b.w16, b.w17, b.c18, b.c19, b.c31, b.c32)
         );
         assert_eq!(u32::from_le_bytes(rolled[0..4].try_into().unwrap()), 0x2001);
+    }
+
+    #[test]
+    fn group_version_rolling_rules() {
+        let bits = rolled_group_bits(0x2000_0000, 0x1fff_e000).unwrap();
+        assert_eq!(bits[0], 0);
+        // Every lane produces a distinct subset of the mask.
+        let mut sorted = bits.to_vec();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(sorted.len(), GROUP_SIZE);
+        assert!(bits.iter().all(|&b| b & !0x1fff_e000 == 0));
+
+        // Too few rollable bits or overlapping version bits -> None.
+        assert!(rolled_group_bits(0x2000_0000, (1 << (GROUP_SHIFT - 1)) - 1).is_none());
+        assert!(rolled_group_bits(0x2000_2000, 0x1fff_e000).is_none());
+    }
+
+    #[test]
+    fn group_versions_match_individual_params() {
+        let header: [u8; 80] = hex::decode(GENESIS_HEADER_HEX).unwrap().try_into().unwrap();
+        let base_version = u32::from_le_bytes(header[0..4].try_into().unwrap());
+        let bits = rolled_group_bits(base_version, 0x1fff_e000).unwrap();
+        let gv = kernel_group_versions(&header, &bits);
+        for lane in [0usize, 1, GROUP_SIZE / 2, GROUP_SIZE - 1] {
+            let expected = kernel_params(&with_version(&header, base_version | bits[lane]));
+            for word in 0..8 {
+                assert_eq!(gv.mid[word][lane], expected.mid[word]);
+                assert_eq!(gv.pre[word][lane], expected.pre[word]);
+            }
+        }
     }
 
     #[test]

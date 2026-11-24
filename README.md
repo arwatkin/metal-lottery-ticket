@@ -10,7 +10,7 @@ in a `.env` file.
 
 As an investment, no. As a lottery ticket, absolutely.
 
-The honest maths: an M1 Max does roughly 1 GH/s, and the Bitcoin network does
+The honest maths: an M1 Max does roughly 1.2 GH/s, and the Bitcoin network does
 about a trillion times that. On average you'd find a block about once every
 twenty million years, and the electricity will cost more than you can expect to
 earn. The dashboard shows your live odds, so nothing is hidden.
@@ -112,10 +112,8 @@ Headless mode is chosen automatically when the output is not a terminal, so
 A Bitcoin block header is 80 bytes and is hashed as `SHA256(SHA256(header))`.
 Mining means changing the 4-byte nonce at the end of the header until that hash,
 read as a number, falls below the network target. When all 2³² nonces are used
-up (about every 8 seconds on an M1 Max, which tries each nonce under two header
-versions when the pool allows it) the miner changes the `extranonce2`
-field inside the coinbase transaction, which changes the merkle root and gives a
-fresh header to search.
+up the miner changes the `extranonce2` field inside the coinbase transaction,
+which changes the merkle root and gives a fresh header to search.
 
 | Module            | Role                                                                    |
 | ----------------- | ----------------------------------------------------------------------- |
@@ -147,12 +145,22 @@ compressions (192 rounds); the kernel computes about 121 of them:
   instructions it can issue, and a 32-bit literal costs an extra instruction to
   load. The round constants are passed in the parameter buffer instead, which
   the GPU keeps in registers every instruction can read for free.
-- **Paired lanes.** If the pool allows version rolling (BIP 310/320, which most
-  pools do), neighbouring GPU threads hash the same nonce under two header
-  versions. The version only affects the first block, so both threads need the
-  same message schedule for the second; each computes every other word and
-  they swap results through the SIMD shuffle network. That saves about 4%.
-  Without version rolling the miner uses a one-thread-per-nonce kernel.
+- **Version rolling.** Most pools let miners change some bits of the header's
+  version field (BIP 310/320). The version only affects the first block, so
+  every version of a header needs the same message schedule for the second,
+  and the miner hashes each nonce under many versions to share that work:
+  - **Threadgroup kernel**, when the pool grants at least 9 version bits (ckpool
+    grants 16): a threadgroup of 512 threads takes one nonce under 512
+    versions. One thread computes the shared schedule into threadgroup memory
+    and the rest read it with vector loads, so each thread is left with the
+    rounds and the second hash. About 13% faster than paired lanes.
+  - **Paired lanes**, with fewer bits: neighbouring threads hash a nonce under
+    two versions, each computing every other schedule word and swapping them
+    through the SIMD shuffle network.
+  - Without version rolling, one thread per nonce.
+
+  Each header now lasts 2³² nonces times the number of versions: about half an
+  hour with the threadgroup kernel, rather than four seconds.
 
 Nonces that pass this 32-bit test (about one in 4.3 billion) are returned to the
 CPU, which recomputes the full hash and compares it with the pool and network
@@ -164,7 +172,8 @@ Apple's shader compiler turns each rotate into an `extr` (extract from a registe
 pair) and, before rotating a value, copies it into a second register so the
 instruction never reads the same register twice. The GPU does not need that:
 `extr` reading one register twice is a correct rotate. In a kernel limited by
-how many instructions it can issue, those ~650 copies per hash cost about 5%.
+how many instructions it can issue, those hundreds of copies per hash cost
+about 5%.
 
 So at start-up the miner has a child process compile the kernels into a Metal
 binary archive, removes the copies from the GPU machine code itself, and builds
@@ -184,15 +193,15 @@ uses the compiler's code unchanged and says why. `KERNEL_PATCH=off` forces that.
 Since it relies on undocumented details of Apple's GPU, a future macOS may well
 make the patch stop applying; mining continues either way.
 
-At start-up both kernels must find the nonce of the genesis block (the paired
-one in either lane), so a miscompiled or misbehaving GPU is caught before any
-mining starts.
+At start-up every kernel must find the nonce of the genesis block (the paired
+one in either lane, the threadgroup one in several of its 512 lanes), so a
+miscompiled or misbehaving GPU is caught before any mining starts.
 
 ### Performance
 
-| Machine              | Single lane | Paired lanes |
-| -------------------- | ----------- | ------------ |
-| M1 Max (32-core GPU) | ~998 MH/s   | ~1.05 GH/s   |
+| Machine              | Single lane | Paired lanes | Threadgroup |
+| -------------------- | ----------- | ------------ | ----------- |
+| M1 Max (32-core GPU) | ~1.00 GH/s  | ~1.04 GH/s   | ~1.18 GH/s  |
 
 Numbers for other chips are welcome — run `--benchmark` and open a pull request.
 

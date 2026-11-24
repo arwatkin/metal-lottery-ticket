@@ -49,7 +49,15 @@ const ALU: &[&str] = &[
     "icmpsel",
     "simd_shuffle_xor",
 ];
-const PROLOGUE: &[&str] = &["get_sr", "device_load", "wait"];
+const PROLOGUE: &[&str] = &[
+    "get_sr",
+    "device_load",
+    "threadgroup_load",
+    "threadgroup_store",
+    "threadgroup_barrier",
+    "memory_barrier",
+    "wait",
+];
 const EPILOGUE: &[&str] = &[
     "if_icmp",
     "jmp_exec_none",
@@ -132,15 +140,50 @@ fn flip_canary(text: &mut [u8], main: usize) -> Result<bool> {
 /// with zeros) and the number of copies removed and rotates rewritten.
 pub fn remove_rotate_copies(text: &[u8], main: usize) -> Result<(Vec<u8>, usize, usize)> {
     let program = decode_program(text, main)?;
-    let control = program
+    // If the kernel has a threadgroup_barrier (Kernel::Group), patch the
+    // straight-line hash body starting right after the last pre-barrier
+    // `pop_exec` (which includes rounds 4..15 hoisted above the barrier) up to
+    // the epilogue branch. No branch spans this region.
+    let region_start = match program
+        .iter()
+        .rposition(|i| i.name == "threadgroup_barrier")
+    {
+        Some(barrier) => {
+            let ifs = program[..barrier]
+                .iter()
+                .filter(|i| i.name == "if_icmp")
+                .count();
+            let pops = program[..barrier]
+                .iter()
+                .filter(|i| i.name == "pop_exec")
+                .count();
+            ensure!(
+                ifs == pops,
+                "unbalanced control flow before threadgroup_barrier ({ifs} if_icmp vs {pops} pop_exec)"
+            );
+            let after_branch = program[..barrier]
+                .iter()
+                .rposition(|i| i.name == "pop_exec")
+                .map_or(0, |p| p + 1);
+            ensure!(
+                program[after_branch..barrier]
+                    .iter()
+                    .all(|i| ALU.contains(&i.name) || PROLOGUE.contains(&i.name)),
+                "unexpected control flow between pre-barrier pop_exec and threadgroup_barrier"
+            );
+            after_branch
+        }
+        None => 0,
+    };
+    let region_end = program[region_start..]
         .iter()
         .position(|i| !ALU.contains(&i.name) && !PROLOGUE.contains(&i.name))
-        .unwrap_or(program.len());
+        .map_or(program.len(), |rel| region_start + rel);
 
     let mut remove = vec![false; program.len()];
     let mut rewrite = vec![false; program.len()];
-    for (i, instr) in program[..control].iter().enumerate() {
-        let Some((d, s)) = as_copy(instr) else {
+    for i in region_start..region_end {
+        let Some((d, s)) = as_copy(&program[i]) else {
             continue;
         };
         if let Some(uses) = copy_uses(&program, i, d, s) {
@@ -519,5 +562,19 @@ mod tests {
         // Missing `stop`.
         let text = code(&ROTATES[..ROTATES.len() - 1]);
         assert!(remove_rotate_copies(&text, 0).is_err());
+    }
+
+    #[test]
+    fn patches_after_threadgroup_barrier() {
+        // Place a threadgroup_barrier (0x0068) before ROTATES; the copy after
+        // the barrier must still be removed while leaving the barrier intact.
+        let mut hexes = vec!["6800"];
+        hexes.extend_from_slice(ROTATES);
+        let text = code(&hexes);
+        let (out, removed, rewritten) = remove_rotate_copies(&text, 0).unwrap();
+        assert_eq!((removed, rewritten), (1, 3));
+        let program = decode_program(&out, 0).unwrap();
+        assert_eq!(program[0].name, "threadgroup_barrier");
+        assert_eq!(program[1].name, "iadd");
     }
 }

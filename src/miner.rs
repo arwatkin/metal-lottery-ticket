@@ -1,6 +1,8 @@
 //! The mining loop: feeds work to the GPU and checks what comes back.
 
-use crate::gpu::{Batch, Candidate, Codegen, Gpu, HASHES_PER_ROW, Kernel, KernelParams};
+use crate::gpu::{
+    Batch, Candidate, Codegen, GROUP_SIZE, Gpu, GroupVersions, HASHES_PER_ROW, Kernel, KernelParams,
+};
 use crate::sha256::sha256d;
 use crate::state::{Level, Shared};
 use crate::stratum::{Client, Share};
@@ -20,14 +22,25 @@ const STARTUP_BENCHMARK: Duration = Duration::from_millis(1500);
 /// Length of a hashing burst when INTENSITY is below 100.
 const THROTTLE_BURST: Duration = Duration::from_secs(1);
 
+/// Version-rolling mode chosen for a [`Unit`].
+enum Rolling {
+    None,
+    Pair {
+        bits: u32,
+        header: [u8; 80],
+    },
+    Group {
+        bits: Box<[u32; GROUP_SIZE]>,
+        versions: Box<GroupVersions>,
+    },
+}
+
 /// One header's worth of work: a job with a fixed extranonce2.
 struct Unit {
     job: Arc<Job>,
     extranonce2: Vec<u8>,
     header: [u8; 80],
-    /// With version rolling: the version bit the odd GPU lanes add, and the
-    /// header they hash.
-    rolled: Option<(u32, [u8; 80])>,
+    rolling: Rolling,
     kernel: Kernel,
     params: KernelParams,
     share_target: Target,
@@ -35,20 +48,37 @@ struct Unit {
 }
 
 impl Unit {
-    fn new(job: Arc<Job>, counter: u64) -> Arc<Self> {
+    fn new(job: Arc<Job>, counter: u64, allow_group: bool) -> Arc<Self> {
         let extranonce2 = job.extranonce2(counter);
         let header = job.header(&extranonce2);
-        let rolled = work::rolled_version(job.version, job.version_mask)
-            .map(|version| (version ^ job.version, work::with_version(&header, version)));
-        let (kernel, params) = match &rolled {
-            Some((_, rolled_header)) => (
+        let (kernel, params, rolling) = if allow_group
+            && let Some(bits) = work::rolled_group_bits(job.version, job.version_mask)
+        {
+            let params = work::kernel_params(&header);
+            let versions = work::kernel_group_versions(&header, &bits);
+            (
+                Kernel::Group,
+                params,
+                Rolling::Group {
+                    bits: Box::new(bits),
+                    versions,
+                },
+            )
+        } else if let Some(version) = work::rolled_version(job.version, job.version_mask) {
+            let rolled_header = work::with_version(&header, version);
+            (
                 Kernel::Pair,
-                work::kernel_params_pair(&header, rolled_header),
-            ),
-            None => (Kernel::Single, work::kernel_params(&header)),
+                work::kernel_params_pair(&header, &rolled_header),
+                Rolling::Pair {
+                    bits: version ^ job.version,
+                    header: rolled_header,
+                },
+            )
+        } else {
+            (Kernel::Single, work::kernel_params(&header), Rolling::None)
         };
         Arc::new(Self {
-            rolled,
+            rolling,
             kernel,
             params,
             share_target: Target::from_difficulty(job.share_difficulty),
@@ -57,6 +87,13 @@ impl Unit {
             header,
             job,
         })
+    }
+
+    fn group_versions(&self) -> Option<&GroupVersions> {
+        match &self.rolling {
+            Rolling::Group { versions, .. } => Some(versions),
+            _ => None,
+        }
     }
 }
 
@@ -88,6 +125,18 @@ fn genesis_rolled() -> [u8; 80] {
     work::with_version(&header, version | 1 << 13)
 }
 
+/// Builds a [`GroupVersions`] table where `real_lane` holds the real genesis
+/// header and every other lane holds a distinct rolled version.
+fn genesis_group_versions(real_lane: usize) -> Box<GroupVersions> {
+    let real = genesis();
+    let base_version = u32::from_le_bytes(real[0..4].try_into().unwrap());
+    let bits = work::rolled_group_bits(base_version, 0x1fff_e000).expect("mask has >= 8 bits");
+    let mut swapped = bits;
+    // Lane 0 originally has bits == 0 (the real genesis header); swap with real_lane.
+    swapped.swap(0, real_lane);
+    work::kernel_group_versions(&real, &swapped)
+}
+
 /// Opens the GPU and checks its kernels with [`self_test`]. Hand-patched
 /// kernels that fail it are replaced by the compiler's unpatched ones, which
 /// must then pass.
@@ -107,36 +156,53 @@ pub fn open_tested_gpu<T: Default>() -> Result<Gpu<T>> {
     }
 }
 
-/// Checks both kernels against the genesis block: the GPU must find its
-/// nonce, in either lane of the paired kernel.
+/// Checks every kernel against the genesis block: the GPU must find its nonce
+/// in Single, in either lane of Pair, and across lanes of Group.
 pub fn self_test<T: Default>(gpu: &mut Gpu<T>) -> Result<()> {
     let (real, other) = (genesis(), genesis_rolled());
-    expect_genesis(gpu, Kernel::Single, work::kernel_params(&real), 0)?;
+    let single_params = work::kernel_params(&real);
+    expect_genesis(gpu, Kernel::Single, single_params, None, 0)?;
     expect_genesis(
         gpu,
         Kernel::Pair,
         work::kernel_params_pair(&real, &other),
+        None,
         0,
     )?;
     expect_genesis(
         gpu,
         Kernel::Pair,
         work::kernel_params_pair(&other, &real),
+        None,
         1,
-    )
+    )?;
+    if gpu.supports_group() {
+        for lane in [0usize, GROUP_SIZE / 2 - 1, GROUP_SIZE - 1] {
+            let versions = genesis_group_versions(lane);
+            expect_genesis(
+                gpu,
+                Kernel::Group,
+                single_params,
+                Some(&versions),
+                lane as u32,
+            )?;
+        }
+    }
+    Ok(())
 }
 
 fn expect_genesis<T: Default>(
     gpu: &mut Gpu<T>,
     kernel: Kernel,
     mut params: KernelParams,
+    versions: Option<&GroupVersions>,
     lane: u32,
 ) -> Result<()> {
     let nonce = u32::from_be_bytes(genesis()[76..80].try_into().unwrap());
     let rows = 64;
     let span = rows as u64 * nonces_per_row(kernel);
     params.base = nonce & !(span as u32 - 1);
-    gpu.submit(kernel, &params, rows, T::default())?;
+    gpu.submit(kernel, &params, versions, rows, T::default())?;
     let batch = gpu.wait()?.expect("a dispatch was just queued");
     let expected = Candidate { nonce, lane };
     if batch.candidates != [expected] {
@@ -151,16 +217,17 @@ fn expect_genesis<T: Default>(
 /// Measures raw hashrate (H/s) of `kernel` on a fixed header.
 pub fn benchmark<T: Default>(gpu: &mut Gpu<T>, kernel: Kernel, duration: Duration) -> Result<f64> {
     let mut params = match kernel {
-        Kernel::Single => work::kernel_params(&genesis()),
+        Kernel::Single | Kernel::Group => work::kernel_params(&genesis()),
         Kernel::Pair => work::kernel_params_pair(&genesis(), &genesis_rolled()),
     };
+    let versions = (kernel == Kernel::Group).then(|| genesis_group_versions(0));
     let rows = 1024;
     let step = (rows as u64 * nonces_per_row(kernel)) as u32;
     let start = Instant::now();
     let mut hashes = 0u64;
     while start.elapsed() < duration {
         while gpu.has_capacity() {
-            gpu.submit(kernel, &params, rows, T::default())?;
+            gpu.submit(kernel, &params, versions.as_deref(), rows, T::default())?;
             params.base = params.base.wrapping_add(step);
         }
         hashes += gpu.wait()?.map_or(0, |batch| batch.hashes);
@@ -180,8 +247,13 @@ fn mine(shared: &Shared, client: &Client) -> Result<()> {
             format!("Using unpatched GPU kernels  ·  {reason}"),
         );
     }
-    // Most pools allow version rolling, so measure the paired kernel.
-    let hashrate = benchmark(&mut gpu, Kernel::Pair, STARTUP_BENCHMARK)?;
+    // Most pools allow version rolling (BIP 310/320), so measure the fastest rolling kernel.
+    let bench_kernel = if gpu.supports_group() {
+        Kernel::Group
+    } else {
+        Kernel::Pair
+    };
+    let hashrate = benchmark(&mut gpu, bench_kernel, STARTUP_BENCHMARK)?;
     shared.log(
         Level::Good,
         format!(
@@ -211,6 +283,9 @@ fn mine(shared: &Shared, client: &Client) -> Result<()> {
     let mut offset = 0u64;
     let mut was_paused = false;
 
+    let allow_group = gpu.supports_group();
+    let mut logged_kernel: Option<Kernel> = None;
+
     while !shared.quitting() {
         let current = shared.generation.load(Ordering::Acquire);
         if current != generation {
@@ -218,7 +293,18 @@ fn mine(shared: &Shared, client: &Client) -> Result<()> {
             live_job = shared.current_job();
             counter = 0;
             offset = 0;
-            unit = live_job.clone().map(|job| Unit::new(job, counter));
+            unit = live_job
+                .clone()
+                .map(|job| Unit::new(job, counter, allow_group));
+        }
+        if let Some(current) = &unit
+            && logged_kernel != Some(current.kernel)
+        {
+            logged_kernel = Some(current.kernel);
+            shared.log(
+                Level::Info,
+                format!("GPU kernel  ·  {}", current.kernel.describe()),
+            );
         }
 
         let paused = shared.paused.load(Ordering::Relaxed);
@@ -248,6 +334,7 @@ fn mine(shared: &Shared, client: &Client) -> Result<()> {
                 gpu.submit(
                     current_unit.kernel,
                     &params,
+                    current_unit.group_versions(),
                     rows_now,
                     Some(current_unit.clone()),
                 )?;
@@ -256,7 +343,7 @@ fn mine(shared: &Shared, client: &Client) -> Result<()> {
                     // Every nonce tried: change the coinbase to get a fresh header.
                     counter += 1;
                     offset = 0;
-                    unit = Some(Unit::new(current_unit.job.clone(), counter));
+                    unit = Some(Unit::new(current_unit.job.clone(), counter, allow_group));
                 }
             }
         }
@@ -302,9 +389,16 @@ fn check(
     live_job: Option<&Arc<Job>>,
 ) {
     let word = candidate.nonce;
-    let (mut header, version_bits) = match (candidate.lane, &unit.rolled) {
+    let (header, version_bits) = match (candidate.lane as usize, &unit.rolling) {
         (0, _) => (unit.header, None),
-        (1, Some((bits, rolled))) => (*rolled, Some(*bits)),
+        (1, Rolling::Pair { bits, header }) => (*header, Some(*bits)),
+        (lane, Rolling::Group { bits, .. }) if lane < GROUP_SIZE => {
+            let vbits = bits[lane];
+            (
+                work::with_version(&unit.header, unit.job.version | vbits),
+                (vbits != 0).then_some(vbits),
+            )
+        }
         _ => {
             shared.log(
                 Level::Error,
@@ -313,6 +407,7 @@ fn check(
             return;
         }
     };
+    let mut header = header;
     work::set_nonce_word(&mut header, word);
     let hash = sha256d(&header);
     if hash[28..] != [0; 4] {

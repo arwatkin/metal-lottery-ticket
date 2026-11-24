@@ -29,8 +29,8 @@ use std::fmt;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU32, Ordering};
 
-pub use kernel::Kernel;
 use kernel::{GRID_SHIFT, MAX_RESULTS};
+pub use kernel::{GROUP_SHIFT, GROUP_SIZE, Kernel};
 
 // `MTLCreateSystemDefaultDevice` lives in Metal but needs CoreGraphics loaded.
 #[link(name = "CoreGraphics", kind = "framework")]
@@ -65,6 +65,25 @@ pub struct KernelParams {
     /// sit in uniform registers, which saves an instruction per use compared
     /// with literals. Two halves because `Default` stops at 32-element arrays.
     pub kc: [[u32; 32]; 2],
+}
+
+/// Per-version midstates and round-3 states for [`Kernel::Group`], stored in
+/// structure-of-arrays order so SIMD lanes coalesce into contiguous cache lines.
+/// Layout must match `struct GroupVersions` in [`kernel::source`].
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct GroupVersions {
+    pub mid: [[u32; GROUP_SIZE]; 8],
+    pub pre: [[u32; GROUP_SIZE]; 8],
+}
+
+impl Default for GroupVersions {
+    fn default() -> Self {
+        Self {
+            mid: [[0; GROUP_SIZE]; 8],
+            pre: [[0; GROUP_SIZE]; 8],
+        }
+    }
 }
 
 #[repr(C)]
@@ -126,6 +145,7 @@ struct Pipeline {
 struct Slot {
     params: Buffer,
     results: Buffer,
+    versions: Buffer,
 }
 
 struct InFlight<T> {
@@ -147,7 +167,8 @@ pub struct Batch<T> {
 pub struct Gpu<T> {
     name: String,
     queue: Retained<ProtocolObject<dyn MTLCommandQueue>>,
-    pipelines: [Pipeline; 2],
+    pipelines: [Pipeline; 3],
+    supports_group: bool,
     codegen: Codegen,
     free: Vec<Slot>,
     in_flight: VecDeque<InFlight<T>>,
@@ -184,13 +205,17 @@ impl Drop for TempFile {
 }
 
 /// Pipelines straight from the compiler.
-fn compiled_pipelines(device: &Device, functions: &[Function; 2]) -> Result<[PipelineState; 2]> {
+fn compiled_pipelines(device: &Device, functions: &[Function; 3]) -> Result<[PipelineState; 3]> {
     let build = |function: &Function| {
         device
             .newComputePipelineStateWithFunction_error(function)
             .map_err(|e| anyhow!("pipeline creation failed: {}", e.localizedDescription()))
     };
-    Ok([build(&functions[0])?, build(&functions[1])?])
+    Ok([
+        build(&functions[0])?,
+        build(&functions[1])?,
+        build(&functions[2])?,
+    ])
 }
 
 /// Hidden command-line flag: compile the kernels into a binary archive at the
@@ -217,11 +242,12 @@ fn pipeline_descriptor(function: &Function) -> Retained<MTLComputePipelineDescri
     d
 }
 
-/// Entry points stored in the archive: both search kernels, then the canary.
-fn archive_entries() -> [&'static str; 3] {
+/// Entry points stored in the archive: all three search kernels, then the canary.
+fn archive_entries() -> [&'static str; 4] {
     [
         Kernel::Single.entry_point(),
         Kernel::Pair.entry_point(),
+        Kernel::Group.entry_point(),
         kernel::CANARY_ENTRY,
     ]
 }
@@ -260,7 +286,7 @@ fn patched_pipelines(
     device: &Device,
     queue: &ProtocolObject<dyn MTLCommandQueue>,
     library: &ProtocolObject<dyn MTLLibrary>,
-) -> Result<([PipelineState; 2], patch::Stats)> {
+) -> Result<([PipelineState; 3], patch::Stats)> {
     let original = TempFile::new("compiled");
     let exe = std::env::current_exe().context("locating the miner executable")?;
     let child = std::process::Command::new(exe)
@@ -302,9 +328,9 @@ fn patched_pipelines(
             .map_err(ns_error)
             .context("building a pipeline from the patched archive")
     };
-    let [single, pair, canary] = archive_entries();
+    let [single, pair, group, canary] = archive_entries();
     check_canary(device, queue, &build(canary)?)?;
-    Ok(([build(single)?, build(pair)?], stats))
+    Ok(([build(single)?, build(pair)?, build(group)?], stats))
 }
 
 /// Runs the canary kernel: `io[1] = io[0] ^ constant`, where the patch
@@ -373,12 +399,13 @@ impl<T> Gpu<T> {
         let queue = device
             .newCommandQueue()
             .context("failed to create a Metal command queue")?;
-        let compiled = || -> Result<[PipelineState; 2]> {
+        let compiled = || -> Result<[PipelineState; 3]> {
             compiled_pipelines(
                 &device,
                 &[
                     function(&library, Kernel::Single.entry_point())?,
                     function(&library, Kernel::Pair.entry_point())?,
+                    function(&library, Kernel::Group.entry_point())?,
                 ],
             )
         };
@@ -392,12 +419,20 @@ impl<T> Gpu<T> {
                 ),
             },
         };
-        let pipelines = states.map(|state| {
+        let supports_group =
+            states[Kernel::Group as usize].maxTotalThreadsPerThreadgroup() >= GROUP_SIZE;
+        let [s_single, s_pair, s_group] = states;
+        let make_pipeline = |state: PipelineState, fixed_width: Option<usize>| {
             let max_group = state.maxTotalThreadsPerThreadgroup().max(1);
-            // Paired lanes must share a SIMD group, so groups must be even.
-            let group_width = (1usize << max_group.ilog2()).clamp(2, 1 << GRID_SHIFT);
+            let group_width = fixed_width
+                .unwrap_or_else(|| (1usize << max_group.ilog2()).clamp(2, 1 << GRID_SHIFT));
             Pipeline { state, group_width }
-        });
+        };
+        let pipelines = [
+            make_pipeline(s_single, None),
+            make_pipeline(s_pair, None),
+            make_pipeline(s_group, Some(GROUP_SIZE)),
+        ];
         let mut free = Vec::with_capacity(QUEUE_DEPTH);
         for _ in 0..QUEUE_DEPTH {
             let alloc = |len: usize| {
@@ -408,6 +443,7 @@ impl<T> Gpu<T> {
             free.push(Slot {
                 params: alloc(size_of::<KernelParams>())?,
                 results: alloc(size_of::<KernelResults>())?,
+                versions: alloc(size_of::<GroupVersions>())?,
             });
         }
 
@@ -415,6 +451,7 @@ impl<T> Gpu<T> {
             name,
             queue,
             pipelines,
+            supports_group,
             codegen,
             free,
             in_flight: VecDeque::new(),
@@ -423,6 +460,11 @@ impl<T> Gpu<T> {
 
     pub fn name(&self) -> &str {
         &self.name
+    }
+
+    /// True if the device supports [`Kernel::Group`]'s threadgroup size.
+    pub fn supports_group(&self) -> bool {
+        self.supports_group
     }
 
     /// Which machine code the kernels run.
@@ -441,19 +483,29 @@ impl<T> Gpu<T> {
 
     /// Queues `rows * HASHES_PER_ROW` hashes with `kernel`, covering
     /// `rows * HASHES_PER_ROW / kernel.threads_per_nonce()` nonces from
-    /// `params.base`. Panics if [`has_capacity`](Self::has_capacity) is false.
+    /// `params.base`. For [`Kernel::Group`], pass `versions`. Panics if
+    /// [`has_capacity`](Self::has_capacity) is false.
     pub fn submit(
         &mut self,
         kernel: Kernel,
         params: &KernelParams,
+        versions: Option<&GroupVersions>,
         rows: u32,
         tag: T,
     ) -> Result<()> {
+        debug_assert!(
+            kernel != Kernel::Group || versions.is_some(),
+            "Kernel::Group requires GroupVersions"
+        );
         let slot = self.free.pop().expect("submit called without capacity");
-        // SAFETY: both buffers are CPU-visible (shared storage), were allocated
-        // with exactly these struct sizes, and no dispatch is using this slot.
+        // SAFETY: all slot buffers are CPU-visible (shared storage), were
+        // allocated with exactly these struct sizes, and no dispatch is using
+        // this slot.
         unsafe {
             slot.params.contents().cast::<KernelParams>().write(*params);
+            if let Some(v) = versions {
+                slot.versions.contents().cast::<GroupVersions>().write(*v);
+            }
             slot.results
                 .contents()
                 .cast::<KernelResults>()
@@ -499,11 +551,14 @@ impl<T> Gpu<T> {
             .context("failed to create a compute encoder")?;
         let pipeline = &self.pipelines[kernel as usize];
         encoder.setComputePipelineState(&pipeline.state);
-        // SAFETY: indices 0 and 1 match the kernel signature and both buffers
-        // outlive the command buffer (they are held by the in-flight entry).
+        // SAFETY: indices match the kernel signature and all buffers outlive
+        // the command buffer (they are held by the in-flight entry).
         unsafe {
             encoder.setBuffer_offset_atIndex(Some(&slot.params), 0, 0);
             encoder.setBuffer_offset_atIndex(Some(&slot.results), 0, 1);
+            if kernel == Kernel::Group {
+                encoder.setBuffer_offset_atIndex(Some(&slot.versions), 0, 2);
+            }
         }
         encoder.dispatchThreadgroups_threadsPerThreadgroup(
             MTLSize {

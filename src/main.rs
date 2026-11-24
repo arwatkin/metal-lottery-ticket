@@ -102,9 +102,18 @@ fn run_benchmark(duration: Duration) -> Result<()> {
     println!("Hashrate   {}  (single lane)", ui::format::hashrate(single));
     let pair = miner::benchmark(&mut gpu, gpu::Kernel::Pair, duration)?;
     println!(
-        "Hashrate   {}  (paired lanes, used when the pool allows version rolling)",
+        "Hashrate   {}  (paired lanes, 1-bit version rolling)",
         ui::format::hashrate(pair)
     );
+    if gpu.supports_group() {
+        let group = miner::benchmark(&mut gpu, gpu::Kernel::Group, duration)?;
+        println!(
+            "Hashrate   {}  ({}-way threadgroup SRAM, used with >= {}-bit version rolling)",
+            ui::format::hashrate(group),
+            gpu::GROUP_SIZE,
+            gpu::GROUP_SHIFT
+        );
+    }
     Ok(())
 }
 

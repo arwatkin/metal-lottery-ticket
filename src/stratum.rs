@@ -338,11 +338,12 @@ fn response(shared: &Shared, client: &Client, state: &mut Session, message: &Val
                 Level::Info,
                 if state.version_mask != 0 {
                     format!(
-                        "Pool allows version rolling (mask {:08x})  ·  paired GPU lanes on",
-                        state.version_mask
+                        "Pool allows version rolling  ·  mask {:08x} ({} bits)",
+                        state.version_mask,
+                        state.version_mask.count_ones()
                     )
                 } else {
-                    "Pool does not offer version rolling  ·  single-lane GPU kernel".into()
+                    "Pool does not offer version rolling".into()
                 },
             );
         }

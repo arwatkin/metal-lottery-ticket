@@ -60,13 +60,22 @@ use std::fmt::Write;
 /// Maximum number of candidate nonces a single dispatch can report.
 pub const MAX_RESULTS: usize = 63;
 
-/// The two search kernels.
+/// log2 of the threadgroup size (and version count) for [`Kernel::Group`].
+pub const GROUP_SHIFT: u32 = 9;
+
+/// Threads per threadgroup (and header versions shared per nonce) in [`Kernel::Group`].
+pub const GROUP_SIZE: usize = 1 << GROUP_SHIFT;
+
+/// The three search kernels.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Kernel {
     /// One thread per nonce, one header version.
     Single = 0,
     /// Two threads per nonce: lane 0 hashes `mid`/`pre`, lane 1 `mid_b`/`pre_b`.
     Pair = 1,
+    /// `GROUP_SIZE` threads per nonce (one threadgroup), sharing Block 2's
+    /// message schedule in threadgroup SRAM across `GROUP_SIZE` rolled versions.
+    Group = 2,
 }
 
 impl Kernel {
@@ -75,6 +84,18 @@ impl Kernel {
         match self {
             Kernel::Single => 1,
             Kernel::Pair => 2,
+            Kernel::Group => GROUP_SIZE as u32,
+        }
+    }
+
+    /// How the kernel spends its threads, for the log.
+    pub fn describe(self) -> String {
+        match self {
+            Kernel::Single => "one header version per nonce".into(),
+            Kernel::Pair => "2 header versions per nonce (paired lanes)".into(),
+            Kernel::Group => {
+                format!("{GROUP_SIZE} header versions per nonce (threadgroup kernel)")
+            }
         }
     }
 
@@ -82,6 +103,7 @@ impl Kernel {
         match self {
             Kernel::Single => "search",
             Kernel::Pair => "search_pair",
+            Kernel::Group => "search_group",
         }
     }
 }
@@ -164,14 +186,21 @@ struct Params {{
 struct Results {{
     atomic_uint count;
     uint nonces[{max_results}];
-    uint lanes[{max_results}];  // 0 = mid/pre header, 1 = mid_b/pre_b header
+    uint lanes[{max_results}];  // version lane index (0 for Single, 0..1 Pair, 0..GROUP_SIZE-1 Group)
+}};
+
+struct GroupVersions {{
+    uint mid[8][{group_size}];
+    uint pre[8][{group_size}];
 }};
 "#,
         max_results = MAX_RESULTS,
+        group_size = GROUP_SIZE,
     )
     .unwrap();
     kernel_body(&mut s, Kernel::Single);
     kernel_body(&mut s, Kernel::Pair);
+    kernel_group_body(&mut s);
     write!(
         s,
         r#"
@@ -294,6 +323,111 @@ kernel void {entry}(constant Params& p [[buffer(0)]],
     for (i, name) in vars(0).iter().enumerate() {
         writeln!(s, "    const uint x{i} = m{i} + {name};").unwrap();
     }
+    hash2_tail(s, if pair { "odd ? 1u : 0u" } else { "0u" });
+}
+
+/// Appends [`Kernel::Group`]: one threadgroup of `GROUP_SIZE` threads shares a
+/// single nonce across `GROUP_SIZE` rolled header versions. Lanes 0 and 1
+/// compute Block 2's message schedule (`K[r] + w[r]`) once into threadgroup
+/// SRAM, and all `GROUP_SIZE` threads consume it via vectorized uniform loads.
+#[allow(clippy::needless_range_loop)]
+fn kernel_group_body(s: &mut String) {
+    write!(
+        s,
+        r#"
+kernel void {entry}(constant Params& p [[buffer(0)]],
+                   device Results& results [[buffer(1)]],
+                   constant GroupVersions& gv [[buffer(2)]],
+                   uint2 tgid [[threadgroup_position_in_grid]],
+                   uint tid [[thread_index_in_threadgroup]])
+{{
+    const uint n = p.base + ((tgid.y << {tg_shift}) | tgid.x);
+    threadgroup uint4 kw4[12];
+
+    if (tid == 0u) {{
+        const uint w16 = p.w16, w17 = p.w17, c18 = p.c18, c19 = p.c19;
+        const uint c31 = p.c31, c32 = p.c32;
+        const uint w18 = c18 + s0(n);
+        const uint w19 = c19 + n;
+        const uint w20 = s1(w18) + 0x80000000u;
+        const uint w21 = s1(w19);
+        const uint w22 = s1(w20) + 640u;
+        const uint w23 = s1(w21) + w16;
+        const uint w24 = s1(w22) + w17;
+        const uint w25 = s1(w23) + w18;
+        const uint w26 = s1(w24) + w19;
+        const uint w27 = s1(w25) + w20;
+        const uint w28 = s1(w26) + w21;
+        const uint w29 = s1(w27) + w22;
+        const uint w30 = s1(w28) + w23 + s0(640u);
+        const uint w31 = s1(w29) + w24 + c31;
+        const uint w32 = s1(w30) + w25 + c32;
+"#,
+        entry = Kernel::Group.entry_point(),
+        tg_shift = GRID_SHIFT - GROUP_SHIFT,
+    )
+    .unwrap();
+    for i in 33..64 {
+        writeln!(
+            s,
+            "        const uint w{i} = s1(w{}) + w{} + s0(w{}) + w{};",
+            i - 2,
+            i - 7,
+            i - 15,
+            i - 16
+        )
+        .unwrap();
+    }
+    for chunk in 0..12 {
+        let r = 16 + chunk * 4;
+        writeln!(
+            s,
+            "        kw4[{chunk}] = uint4(p.kc[{r}] + w{r}, p.kc[{r1}] + w{r1}, p.kc[{r2}] + w{r2}, p.kc[{r3}] + w{r3});",
+            r1 = r + 1,
+            r2 = r + 2,
+            r3 = r + 3,
+        )
+        .unwrap();
+    }
+    s.push_str(
+        "    }\n\
+         \x20   threadgroup_barrier(mem_flags::mem_threadgroup);\n\n\
+         \x20   // ---- Hash 1, block 2: resume after round 3 ------------------------------\n",
+    );
+
+    const LANES: [char; 4] = ['x', 'y', 'z', 'w'];
+    let v = vars(3);
+    for (i, name) in v.iter().enumerate() {
+        let nonce = if i == 3 || i == 7 { " + n" } else { "" };
+        writeln!(s, "    uint {name} = gv.pre[{i}][tid]{nonce};").unwrap();
+    }
+
+    round(s, 4, &k_plus(4, 0x8000_0000));
+    for r in 5..15 {
+        round(s, r, &k_plus(r, 0));
+    }
+    round(s, 15, &k_plus(15, 640));
+
+    for chunk in 0..12 {
+        writeln!(s, "    const uint4 q{chunk} = kw4[{chunk}];").unwrap();
+        for lane in 0..4 {
+            let r = 16 + chunk * 4 + lane;
+            round(s, r, &format!("q{chunk}.{}", LANES[lane]));
+        }
+    }
+
+    s.push_str(
+        "\n    // ---- Hash 2 -----------------------------------------------------------\n",
+    );
+    for (i, name) in vars(0).iter().enumerate() {
+        writeln!(s, "    const uint x{i} = gv.mid[{i}][tid] + {name};").unwrap();
+    }
+    hash2_tail(s, "tid");
+}
+
+/// Emits Block 3 (rounds 0..60 + early-exit check) and closes the kernel.
+#[allow(clippy::needless_range_loop)]
+fn hash2_tail(s: &mut String, lane: &str) {
     for (i, name) in vars(0).iter().enumerate() {
         writeln!(s, "    {name} = 0x{:08x}u;", IV[i]).unwrap();
     }
@@ -309,31 +443,35 @@ kernel void {entry}(constant Params& p [[buffer(0)]],
     }
     round(s, 15, &k_plus(15, 256));
 
-    // x8 = 0x80000000, x9..x14 = 0, x15 = 256.
-    s.push_str(
-        "    uint x16 = s0(x1) + x0;\n\
-         \x20   uint x17 = s1(256u) + s0(x2) + x1;\n\
-         \x20   uint x18 = s1(x16) + s0(x3) + x2;\n\
-         \x20   uint x19 = s1(x17) + s0(x4) + x3;\n\
-         \x20   uint x20 = s1(x18) + s0(x5) + x4;\n\
-         \x20   uint x21 = s1(x19) + s0(x6) + x5;\n\
-         \x20   uint x22 = s1(x20) + 256u + s0(x7) + x6;\n\
-         \x20   uint x23 = s1(x21) + x16 + s0(0x80000000u) + x7;\n\
-         \x20   uint x24 = s1(x22) + x17 + 0x80000000u;\n\
-         \x20   uint x25 = s1(x23) + x18;\n\
-         \x20   uint x26 = s1(x24) + x19;\n\
-         \x20   uint x27 = s1(x25) + x20;\n\
-         \x20   uint x28 = s1(x26) + x21;\n\
-         \x20   uint x29 = s1(x27) + x22;\n\
-         \x20   uint x30 = s1(x28) + x23 + s0(256u);\n\
-         \x20   uint x31 = s1(x29) + x24 + s0(x16) + 256u;\n",
-    );
-    for i in 32..61 {
-        schedule(s, 'x', i);
-    }
+    // Interleave x16..x60 schedule computation with rounds 16..60 to keep
+    // live register pressure as low as possible.
+    let early_x: [&str; 16] = [
+        "uint x16 = s0(x1) + x0;",
+        "uint x17 = s1(256u) + s0(x2) + x1;",
+        "uint x18 = s1(x16) + s0(x3) + x2;",
+        "uint x19 = s1(x17) + s0(x4) + x3;",
+        "uint x20 = s1(x18) + s0(x5) + x4;",
+        "uint x21 = s1(x19) + s0(x6) + x5;",
+        "uint x22 = s1(x20) + 256u + s0(x7) + x6;",
+        "uint x23 = s1(x21) + x16 + s0(0x80000000u) + x7;",
+        "uint x24 = s1(x22) + x17 + 0x80000000u;",
+        "uint x25 = s1(x23) + x18;",
+        "uint x26 = s1(x24) + x19;",
+        "uint x27 = s1(x25) + x20;",
+        "uint x28 = s1(x26) + x21;",
+        "uint x29 = s1(x27) + x22;",
+        "uint x30 = s1(x28) + x23 + s0(256u);",
+        "uint x31 = s1(x29) + x24 + s0(x16) + 256u;",
+    ];
     for r in 16..60 {
+        if r < 32 {
+            writeln!(s, "    {}", early_x[r - 16]).unwrap();
+        } else {
+            schedule(s, 'x', r);
+        }
         round(s, r, &format!("p.kc[{r}] + x{r}"));
     }
+    schedule(s, 'x', 60);
 
     // Round 60 produces the `e` that ends up as the last word of the hash.
     // Only that word is needed: hash[7] == 0  <=>  e == -IV[7].
@@ -352,7 +490,6 @@ kernel void {entry}(constant Params& p [[buffer(0)]],
 "#,
         target = 0u32.wrapping_sub(IV[7]),
         max_results = MAX_RESULTS,
-        lane = if pair { "odd ? 1u : 0u" } else { "0u" },
     )
     .unwrap();
 }
