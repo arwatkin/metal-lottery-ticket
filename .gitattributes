@@ -1,0 +1,3 @@
+# Developer tool (regenerates src/gpu/agx_table.rs), not part of the miner:
+# keep it out of GitHub's language statistics.
+tools/*.py linguist-detectable=false
