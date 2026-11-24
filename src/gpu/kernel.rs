@@ -31,9 +31,21 @@
 //!   to be zero. That word is `IV[7] + e` where `e` is produced by round 60, so
 //!   rounds 61-63 and the final feed-forward additions are never computed.
 //!
-//! Each GPU thread tests a single nonce: on Apple GPUs that measured ~15%
-//! faster than looping over several nonces per thread. The `CH`/`MAJ`
-//! formulations below were likewise picked by benchmark (M1 Max).
+//! Each GPU thread computes a single hash: on Apple GPUs that measured faster
+//! than giving a thread several independent hashes (more live registers halve
+//! the threads a core can keep in flight). The `CH`/`MAJ` formulations below
+//! were likewise picked by benchmark (M1 Max).
+//!
+//! # Paired lanes (version rolling)
+//!
+//! With [`Kernel::Pair`], neighbouring SIMD lanes hash the *same* nonce under
+//! two header versions (the second with one BIP 320 version bit set). The
+//! version only affects block 1, so both lanes need the same block-2 message
+//! schedule. They split it: at each step the even lane computes `w[a]` and the
+//! odd lane `w[a + 1]` (possible because `w[i]` depends on `w[i - 2]`, not
+//! `w[i - 1]`), then they swap results with `simd_shuffle_xor`. Every thread
+//! still computes exactly one hash, so occupancy is unchanged, and the shared
+//! schedule makes the kernel about 4% faster on an M1 Max.
 //!
 //! Candidates that pass the 32-bit zero test (one in ~4.29 billion hashes) are
 //! appended to a small result buffer and fully verified on the CPU.
@@ -43,6 +55,32 @@ use std::fmt::Write;
 
 /// Maximum number of candidate nonces a single dispatch can report.
 pub const MAX_RESULTS: usize = 63;
+
+/// The two search kernels.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Kernel {
+    /// One thread per nonce, one header version.
+    Single = 0,
+    /// Two threads per nonce: lane 0 hashes `mid`/`pre`, lane 1 `mid_b`/`pre_b`.
+    Pair = 1,
+}
+
+impl Kernel {
+    /// GPU threads (and hashes) spent on each nonce.
+    pub const fn threads_per_nonce(self) -> u32 {
+        match self {
+            Kernel::Single => 1,
+            Kernel::Pair => 2,
+        }
+    }
+
+    pub const fn entry_point(self) -> &'static str {
+        match self {
+            Kernel::Single => "search",
+            Kernel::Pair => "search_pair",
+        }
+    }
+}
 
 /// log2 of the dispatch grid width, in threads.
 pub const GRID_SHIFT: u32 = 14;
@@ -83,10 +121,9 @@ fn schedule(out: &mut String, prefix: char, i: usize) {
     .unwrap();
 }
 
-/// Builds the kernel source. Each GPU thread tests exactly one nonce.
-#[allow(clippy::needless_range_loop)] // rounds are indexed by number throughout
+/// Builds the Metal library source: shared definitions plus both kernels.
 pub fn source() -> String {
-    let mut s = String::with_capacity(32 * 1024);
+    let mut s = String::with_capacity(64 * 1024);
     write!(
         s,
         r#"#include <metal_stdlib>
@@ -115,31 +152,67 @@ struct Params {{
     uint c32;      // constant part of w32
     uint base;     // first nonce word of this dispatch
     uint pad;
+    uint mid_b[8]; // Kernel::Pair, odd lanes: the rolled header version
+    uint pre_b[8];
 }};
 
 struct Results {{
     atomic_uint count;
     uint nonces[{max_results}];
+    uint lanes[{max_results}];  // 0 = mid/pre header, 1 = mid_b/pre_b header
 }};
+"#,
+        max_results = MAX_RESULTS,
+    )
+    .unwrap();
+    kernel_body(&mut s, Kernel::Single);
+    kernel_body(&mut s, Kernel::Pair);
+    s
+}
 
-kernel void search(constant Params& p [[buffer(0)]],
+/// Appends one kernel function.
+#[allow(clippy::needless_range_loop)] // rounds are indexed by number throughout
+fn kernel_body(s: &mut String, kernel: Kernel) {
+    let pair = kernel == Kernel::Pair;
+    // Pair: lanes 2k and 2k+1 share nonce k; the odd lane uses the `_b` header.
+    let pick = |field: &str, i: usize| {
+        if pair {
+            format!("odd ? p.{field}_b[{i}] : p.{field}[{i}]")
+        } else {
+            format!("p.{field}[{i}]")
+        }
+    };
+    write!(
+        s,
+        r#"
+kernel void {entry}(constant Params& p [[buffer(0)]],
                    device Results& results [[buffer(1)]],
                    uint2 gid [[thread_position_in_grid]])
 {{
-    const uint m0 = p.mid[0], m1 = p.mid[1], m2 = p.mid[2], m3 = p.mid[3];
-    const uint m4 = p.mid[4], m5 = p.mid[5], m6 = p.mid[6], m7 = p.mid[7];
-    const uint p0 = p.pre[0], p1 = p.pre[1], p2 = p.pre[2], p3 = p.pre[3];
-    const uint p4 = p.pre[4], p5 = p.pre[5], p6 = p.pre[6], p7 = p.pre[7];
-    const uint w16 = p.w16, w17 = p.w17, c18 = p.c18, c19 = p.c19;
-    const uint c31 = p.c31, c32 = p.c32;
-    const uint n = p.base + ((gid.y << {grid_shift}) | gid.x);
-
-    // ---- Hash 1, block 2: resume after round 3 ------------------------------
+    const uint gx = (gid.y << {grid_shift}) | gid.x;
 "#,
-        max_results = MAX_RESULTS,
+        entry = kernel.entry_point(),
         grid_shift = GRID_SHIFT,
     )
     .unwrap();
+    if pair {
+        s.push_str(
+            "    const bool odd = (gx & 1u) != 0u;\n    const uint n = p.base + (gx >> 1);\n",
+        );
+    } else {
+        s.push_str("    const uint n = p.base + gx;\n");
+    }
+    for i in 0..8 {
+        writeln!(s, "    const uint m{i} = {};", pick("mid", i)).unwrap();
+    }
+    for i in 0..8 {
+        writeln!(s, "    const uint p{i} = {};", pick("pre", i)).unwrap();
+    }
+    s.push_str(
+        "    const uint w16 = p.w16, w17 = p.w17, c18 = p.c18, c19 = p.c19;\n\
+         \x20   const uint c31 = p.c31, c32 = p.c32;\n\n\
+         \x20   // ---- Hash 1, block 2: resume after round 3 ------------------------------\n",
+    );
 
     // The CPU hands over the canonical state after round 3 (minus the nonce).
     // Map canonical positions onto the variable names round 3 would have used.
@@ -150,35 +223,38 @@ kernel void search(constant Params& p [[buffer(0)]],
     }
 
     // Rounds 4..15 consume padding only.
-    round(&mut s, 4, &k_plus(4, 0x8000_0000));
+    round(s, 4, &k_plus(4, 0x8000_0000));
     for r in 5..15 {
-        round(&mut s, r, &k_plus(r, 0));
+        round(s, r, &k_plus(r, 0));
     }
-    round(&mut s, 15, &k_plus(15, 640));
+    round(s, 15, &k_plus(15, 640));
 
     // Message schedule with zero terms dropped (w5..w14 = 0, w4 and w15 const).
-    s.push_str(
-        "    uint w18 = c18 + s0(n);\n\
-         \x20   uint w19 = c19 + n;\n\
-         \x20   uint w20 = s1(w18) + 0x80000000u;\n\
-         \x20   uint w21 = s1(w19);\n\
-         \x20   uint w22 = s1(w20) + 640u;\n\
-         \x20   uint w23 = s1(w21) + w16;\n\
-         \x20   uint w24 = s1(w22) + w17;\n\
-         \x20   uint w25 = s1(w23) + w18;\n\
-         \x20   uint w26 = s1(w24) + w19;\n\
-         \x20   uint w27 = s1(w25) + w20;\n\
-         \x20   uint w28 = s1(w26) + w21;\n\
-         \x20   uint w29 = s1(w27) + w22;\n\
-         \x20   uint w30 = s1(w28) + w23 + s0(640u);\n\
-         \x20   uint w31 = s1(w29) + w24 + c31;\n\
-         \x20   uint w32 = s1(w30) + w25 + c32;\n",
-    );
-    for i in 33..64 {
-        schedule(&mut s, 'w', i);
+    s.push_str("    uint w18 = c18 + s0(n);\n    uint w19 = c19 + n;\n");
+    if pair {
+        pair_schedule(s);
+    } else {
+        s.push_str(
+            "    uint w20 = s1(w18) + 0x80000000u;\n\
+             \x20   uint w21 = s1(w19);\n\
+             \x20   uint w22 = s1(w20) + 640u;\n\
+             \x20   uint w23 = s1(w21) + w16;\n\
+             \x20   uint w24 = s1(w22) + w17;\n\
+             \x20   uint w25 = s1(w23) + w18;\n\
+             \x20   uint w26 = s1(w24) + w19;\n\
+             \x20   uint w27 = s1(w25) + w20;\n\
+             \x20   uint w28 = s1(w26) + w21;\n\
+             \x20   uint w29 = s1(w27) + w22;\n\
+             \x20   uint w30 = s1(w28) + w23 + s0(640u);\n\
+             \x20   uint w31 = s1(w29) + w24 + c31;\n\
+             \x20   uint w32 = s1(w30) + w25 + c32;\n",
+        );
+        for i in 33..64 {
+            schedule(s, 'w', i);
+        }
     }
     for r in 16..64 {
-        round(&mut s, r, &format!("0x{:08x}u + w{r}", K[r]));
+        round(s, r, &format!("0x{:08x}u + w{r}", K[r]));
     }
 
     // Feed-forward: the first hash becomes message words x0..x7 of block 3.
@@ -192,13 +268,13 @@ kernel void search(constant Params& p [[buffer(0)]],
         writeln!(s, "    {name} = 0x{:08x}u;", IV[i]).unwrap();
     }
     for r in 0..8 {
-        round(&mut s, r, &format!("0x{:08x}u + x{r}", K[r]));
+        round(s, r, &format!("0x{:08x}u + x{r}", K[r]));
     }
-    round(&mut s, 8, &k_plus(8, 0x8000_0000));
+    round(s, 8, &k_plus(8, 0x8000_0000));
     for r in 9..15 {
-        round(&mut s, r, &k_plus(r, 0));
+        round(s, r, &k_plus(r, 0));
     }
-    round(&mut s, 15, &k_plus(15, 256));
+    round(s, 15, &k_plus(15, 256));
 
     // x8 = 0x80000000, x9..x14 = 0, x15 = 256.
     s.push_str(
@@ -220,10 +296,10 @@ kernel void search(constant Params& p [[buffer(0)]],
          \x20   uint x31 = s1(x29) + x24 + s0(x16) + 256u;\n",
     );
     for i in 32..61 {
-        schedule(&mut s, 'x', i);
+        schedule(s, 'x', i);
     }
     for r in 16..60 {
-        round(&mut s, r, &format!("0x{:08x}u + x{r}", K[r]));
+        round(s, r, &format!("0x{:08x}u + x{r}", K[r]));
     }
 
     // Round 60 produces the `e` that ends up as the last word of the hash.
@@ -236,6 +312,7 @@ kernel void search(constant Params& p [[buffer(0)]],
         const uint slot = atomic_fetch_add_explicit(&results.count, 1u, memory_order_relaxed);
         if (slot < {max_results}u) {{
             results.nonces[slot] = n;
+            results.lanes[slot] = {lane};
         }}
     }}
 }}
@@ -243,7 +320,50 @@ kernel void search(constant Params& p [[buffer(0)]],
         k60 = K[60],
         target = 0u32.wrapping_sub(IV[7]),
         max_results = MAX_RESULTS,
+        lane = if pair { "odd ? 1u : 0u" } else { "0u" },
     )
     .unwrap();
-    s
+}
+
+/// Paired-lane message schedule for `w20..w63` (see the module docs).
+///
+/// At step `a` the even lane computes `w[a]` and the odd lane `w[a + 1]`; the
+/// odd lane's inputs are the even lane's shifted by one index. Each lane's own
+/// result from the previous step (`t{a-2}`) is exactly the `w[i - 2]` it needs,
+/// so that operand needs no select. The early words keep their folded forms.
+fn pair_schedule(s: &mut String) {
+    // Operand for "lane A needs w[x], lane B needs w[x + 1]".
+    let pick = |x: usize| {
+        if x >= 20 && x.is_multiple_of(2) {
+            format!("t{x}")
+        } else {
+            format!("(odd ? w{} : w{x})", x + 1)
+        }
+    };
+    for a in (20..64).step_by(2) {
+        let expr = match a {
+            20 => format!("s1({}) + (odd ? 0u : 0x80000000u)", pick(18)),
+            22 => format!("s1({}) + (odd ? w16 : 640u)", pick(20)),
+            24 => format!("s1({}) + (odd ? w18 : w17)", pick(22)),
+            26 => format!("s1({}) + {}", pick(24), pick(19)),
+            28 => format!("s1({}) + {}", pick(26), pick(21)),
+            30 => format!("s1({}) + {} + (odd ? c31 : s0(640u))", pick(28), pick(23)),
+            _ => format!(
+                "s1({}) + {} + s0({}) + {}",
+                pick(a - 2),
+                pick(a - 7),
+                pick(a - 15),
+                pick(a - 16)
+            ),
+        };
+        writeln!(
+            s,
+            "    const uint t{a} = {expr};\n\
+             \x20   const uint u{a} = simd_shuffle_xor(t{a}, 1u);\n\
+             \x20   const uint w{a} = odd ? u{a} : t{a};\n\
+             \x20   const uint w{b} = odd ? t{a} : u{a};",
+            b = a + 1
+        )
+        .unwrap();
+    }
 }

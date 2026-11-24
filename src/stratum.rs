@@ -26,6 +26,9 @@ const SHARE_INTERVAL_SECS: f64 = 20.0;
 const ID_SUBSCRIBE: u64 = 1;
 const ID_AUTHORIZE: u64 = 2;
 const ID_SUGGEST: u64 = 3;
+const ID_CONFIGURE: u64 = 4;
+/// Version bits we ask to roll: the BIP 320 general-purpose range.
+const REQUESTED_VERSION_MASK: u32 = 0x1fff_e000;
 const ID_FIRST_SHARE: u64 = 100;
 
 /// A solved share, ready to be sent to the pool.
@@ -35,6 +38,8 @@ pub struct Share {
     pub extranonce2: String,
     pub ntime: String,
     pub nonce: String,
+    /// Version bits set on top of the job's version (BIP 310), if any.
+    pub version_bits: Option<u32>,
     pub difficulty: f64,
     pub is_block: bool,
 }
@@ -42,6 +47,7 @@ pub struct Share {
 struct Pending {
     difficulty: f64,
     is_block: bool,
+    rolled: bool,
     sent: Instant,
 }
 
@@ -89,14 +95,21 @@ impl Client {
                 Pending {
                     difficulty: share.difficulty,
                     is_block: share.is_block,
+                    rolled: share.version_bits.is_some(),
                     sent: Instant::now(),
                 },
             );
-        let message = json!({
-            "id": id,
-            "method": "mining.submit",
-            "params": [username, share.job_id, share.extranonce2, share.ntime, share.nonce],
-        });
+        let mut params = vec![
+            json!(username),
+            json!(share.job_id),
+            json!(share.extranonce2),
+            json!(share.ntime),
+            json!(share.nonce),
+        ];
+        if let Some(bits) = share.version_bits {
+            params.push(json!(format!("{bits:08x}")));
+        }
+        let message = json!({"id": id, "method": "mining.submit", "params": params});
         let sent = self.send(&message).is_ok();
         if !sent {
             self.pending
@@ -123,6 +136,8 @@ struct Session {
     extranonce2_size: usize,
     difficulty: f64,
     authorized: bool,
+    /// Version bits the pool lets us roll; 0 until it agrees to any.
+    version_mask: u32,
 }
 
 /// Connection thread: keeps a session alive until the miner shuts down.
@@ -195,8 +210,19 @@ fn session(shared: &Shared, client: &Client) -> Result<()> {
         extranonce2_size: 0,
         difficulty: 1.0,
         authorized: false,
+        version_mask: 0,
     };
     client.attach(Some(stream.try_clone()?));
+    // Version rolling lets the GPU pair up lanes (see `gpu::kernel`). Pools
+    // that do not know this extension simply answer with an error.
+    client.send(&json!({
+        "id": ID_CONFIGURE,
+        "method": "mining.configure",
+        "params": [["version-rolling"], {
+            "version-rolling.mask": format!("{REQUESTED_VERSION_MASK:08x}"),
+            "version-rolling.min-bit-count": 1,
+        }],
+    }))?;
     client
         .send(&json!({"id": ID_SUBSCRIBE, "method": "mining.subscribe", "params": [USER_AGENT]}))?;
 
@@ -306,6 +332,20 @@ fn response(shared: &Shared, client: &Client, state: &mut Session, message: &Val
             }))?;
         }
         ID_SUGGEST => {} // optional extension; pools without it reply with an error
+        ID_CONFIGURE => {
+            state.version_mask = granted_version_mask(error, result);
+            shared.log(
+                Level::Info,
+                if state.version_mask != 0 {
+                    format!(
+                        "Pool allows version rolling (mask {:08x})  ·  paired GPU lanes on",
+                        state.version_mask
+                    )
+                } else {
+                    "Pool does not offer version rolling  ·  single-lane GPU kernel".into()
+                },
+            );
+        }
         _ => {
             let pending = client
                 .pending
@@ -314,13 +354,18 @@ fn response(shared: &Shared, client: &Client, state: &mut Session, message: &Val
                 .remove(&id);
             let Some(share) = pending else { return Ok(()) };
             let latency = share.sent.elapsed().as_millis();
+            let rolled = if share.rolled {
+                "  ·  rolled version"
+            } else {
+                ""
+            };
             if ok {
                 shared.accepted.fetch_add(1, Ordering::Relaxed);
                 shared.details().last_accepted = Some(Instant::now());
                 shared.log(
                     Level::Good,
                     format!(
-                        "Share accepted  ·  difficulty {}  ·  {latency} ms",
+                        "Share accepted  ·  difficulty {}  ·  {latency} ms{rolled}",
                         crate::ui::format::difficulty(share.difficulty)
                     ),
                 );
@@ -334,7 +379,7 @@ fn response(shared: &Shared, client: &Client, state: &mut Session, message: &Val
                 shared.rejected.fetch_add(1, Ordering::Relaxed);
                 shared.log(
                     Level::Warn,
-                    format!("Share rejected  ·  {}", describe(error, result)),
+                    format!("Share rejected  ·  {}{rolled}", describe(error, result)),
                 );
             }
         }
@@ -395,6 +440,15 @@ fn notification(
                 );
             }
             state.difficulty = difficulty;
+        }
+        "mining.set_version_mask" => {
+            if let Some(mask) = params
+                .get(0)
+                .and_then(Value::as_str)
+                .and_then(|text| u32::from_str_radix(text, 16).ok())
+            {
+                state.version_mask = mask & REQUESTED_VERSION_MASK;
+            }
         }
         "mining.set_extranonce" => {
             let extranonce1 = params
@@ -458,7 +512,21 @@ fn parse_notify(params: &Value, state: &Session) -> Option<Job> {
         extranonce1: state.extranonce1.clone(),
         extranonce2_size: state.extranonce2_size,
         share_difficulty: state.difficulty,
+        version_mask: state.version_mask,
     })
+}
+
+/// The version-rolling mask granted in a `mining.configure` reply, limited to
+/// the bits we asked for; 0 if rolling was refused or the reply is unusable.
+fn granted_version_mask(error: Option<&Value>, result: &Value) -> u32 {
+    if error.is_some() || result.get("version-rolling").and_then(Value::as_bool) != Some(true) {
+        return 0;
+    }
+    result
+        .get("version-rolling.mask")
+        .and_then(Value::as_str)
+        .and_then(|text| u32::from_str_radix(text, 16).ok())
+        .map_or(0, |mask| mask & REQUESTED_VERSION_MASK)
 }
 
 /// Human-readable reason from a Stratum error (`[code, "message", ...]`).
@@ -488,6 +556,7 @@ mod tests {
             extranonce2_size: 4,
             difficulty: 2.0,
             authorized: true,
+            version_mask: 0x1fff_e000,
         };
         let params = json!([
             "job1",
@@ -517,7 +586,31 @@ mod tests {
             (7, false, 2.0)
         );
         assert_eq!(job.merkle_branch.len(), 1);
+        assert_eq!(job.version_mask, 0x1fff_e000);
         assert!(parse_notify(&json!(["job1", "zz"]), &state).is_none());
+    }
+
+    #[test]
+    fn version_rolling_negotiation() {
+        // solo.ckpool.org's actual reply.
+        let granted = json!({"version-rolling": true, "version-rolling.mask": "1fffe000"});
+        assert_eq!(granted_version_mask(None, &granted), 0x1fff_e000);
+        // Bits outside what we asked for are dropped.
+        let wide = json!({"version-rolling": true, "version-rolling.mask": "ffffffff"});
+        assert_eq!(granted_version_mask(None, &wide), REQUESTED_VERSION_MASK);
+        let refused = json!({"version-rolling": false});
+        assert_eq!(granted_version_mask(None, &refused), 0);
+        assert_eq!(
+            granted_version_mask(Some(&json!([20, "Unknown method"])), &Value::Null),
+            0
+        );
+        assert_eq!(
+            granted_version_mask(
+                None,
+                &json!({"version-rolling": true, "version-rolling.mask": "zz"})
+            ),
+            0
+        );
     }
 
     #[test]

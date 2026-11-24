@@ -99,6 +99,8 @@ pub struct Job {
     pub extranonce2_size: usize,
     /// Difficulty the pool wants shares to meet.
     pub share_difficulty: f64,
+    /// Header version bits the pool lets us change (BIP 310); 0 if none.
+    pub version_mask: u32,
 }
 
 impl Job {
@@ -160,6 +162,37 @@ impl Job {
     }
 }
 
+/// The header version the second GPU lane hashes, or `None` if the pool does
+/// not allow version rolling for this job.
+///
+/// Lane 1 sets the lowest bit of the pool's mask. Rolling is only used when
+/// the job's version has no bits inside the mask: then the pool rebuilds the
+/// same header whether it ORs (as ckpool does), XORs or masks in the bits we
+/// submit, so shares are valid on any pool.
+pub fn rolled_version(version: u32, mask: u32) -> Option<u32> {
+    (mask != 0 && version & mask == 0).then(|| version | (mask & mask.wrapping_neg()))
+}
+
+/// Returns `header` with its version field replaced.
+pub fn with_version(header: &[u8; 80], version: u32) -> [u8; 80] {
+    let mut out = *header;
+    out[0..4].copy_from_slice(&version.to_le_bytes());
+    out
+}
+
+/// Kernel parameters for [`crate::gpu::Kernel::Pair`]: the even lanes hash
+/// `header`, the odd lanes `rolled`. The two may differ only in the version,
+/// which lies in the first 64 bytes, so the block-2 constants are shared.
+pub fn kernel_params_pair(header: &[u8; 80], rolled: &[u8; 80]) -> KernelParams {
+    debug_assert_eq!(header[4..], rolled[4..]);
+    let b = kernel_params(rolled);
+    KernelParams {
+        mid_b: b.mid,
+        pre_b: b.pre,
+        ..kernel_params(header)
+    }
+}
+
 /// Precomputes everything about a header that does not depend on the nonce.
 /// See [`crate::gpu::kernel`] for how the kernel uses each field.
 pub fn kernel_params(header: &[u8; 80]) -> KernelParams {
@@ -200,6 +233,8 @@ pub fn kernel_params(header: &[u8; 80]) -> KernelParams {
         c32: small_sigma0(w17).wrapping_add(w16),
         base: 0,
         pad: 0,
+        mid_b: [0; 8],
+        pre_b: [0; 8],
     }
 }
 
@@ -293,6 +328,7 @@ mod tests {
             extranonce1: coinbase[44..47].to_vec(),
             extranonce2_size: 2,
             share_difficulty: 1.0,
+            version_mask: 0,
         };
         let mut header = job.header(&coinbase[47..49]);
         header[76..80].copy_from_slice(&2573394689u32.to_le_bytes());
@@ -307,6 +343,34 @@ mod tests {
             "9962e301"
         );
         assert_eq!(job.extranonce2(0x0102), vec![1, 2]);
+    }
+
+    #[test]
+    fn version_rolling_rules() {
+        // ckpool's mask: lane 1 sets bit 13.
+        assert_eq!(rolled_version(0x2000_0000, 0x1fff_e000), Some(0x2000_2000));
+        // No mask, or job bits already inside the mask: no rolling.
+        assert_eq!(rolled_version(0x2000_0000, 0), None);
+        assert_eq!(rolled_version(0x2000_4000, 0x1fff_e000), None);
+        // The rolled bit is the lowest one the pool allows.
+        assert_eq!(rolled_version(0x2000_0000, 0x0010_0000), Some(0x2010_0000));
+    }
+
+    #[test]
+    fn pair_params_share_block_two() {
+        let header: [u8; 80] = hex::decode(GENESIS_HEADER_HEX).unwrap().try_into().unwrap();
+        let rolled = with_version(&header, 1 | 1 << 13);
+        let pair = kernel_params_pair(&header, &rolled);
+        let a = kernel_params(&header);
+        let b = kernel_params(&rolled);
+        assert_eq!((pair.mid, pair.pre), (a.mid, a.pre));
+        assert_eq!((pair.mid_b, pair.pre_b), (b.mid, b.pre));
+        assert_ne!(pair.mid, pair.mid_b);
+        assert_eq!(
+            (a.w16, a.w17, a.c18, a.c19, a.c31, a.c32),
+            (b.w16, b.w17, b.c18, b.c19, b.c31, b.c32)
+        );
+        assert_eq!(u32::from_le_bytes(rolled[0..4].try_into().unwrap()), 0x2001);
     }
 
     #[test]
@@ -327,6 +391,7 @@ mod tests {
             extranonce1: vec![],
             extranonce2_size: 4,
             share_difficulty: 1.0,
+            version_mask: 0,
         };
         assert_eq!(job.height(), Some(789_824));
     }

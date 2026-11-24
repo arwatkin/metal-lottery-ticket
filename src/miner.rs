@@ -1,6 +1,6 @@
 //! The mining loop: feeds work to the GPU and checks what comes back.
 
-use crate::gpu::{Batch, Gpu, HASHES_PER_ROW, KernelParams};
+use crate::gpu::{Batch, Candidate, Gpu, HASHES_PER_ROW, Kernel, KernelParams};
 use crate::sha256::sha256d;
 use crate::state::{Level, Shared};
 use crate::stratum::{Client, Share};
@@ -25,6 +25,10 @@ struct Unit {
     job: Arc<Job>,
     extranonce2: Vec<u8>,
     header: [u8; 80],
+    /// With version rolling: the version bit the odd GPU lanes add, and the
+    /// header they hash.
+    rolled: Option<(u32, [u8; 80])>,
+    kernel: Kernel,
     params: KernelParams,
     share_target: Target,
     network_target: Target,
@@ -34,8 +38,19 @@ impl Unit {
     fn new(job: Arc<Job>, counter: u64) -> Arc<Self> {
         let extranonce2 = job.extranonce2(counter);
         let header = job.header(&extranonce2);
+        let rolled = work::rolled_version(job.version, job.version_mask)
+            .map(|version| (version ^ job.version, work::with_version(&header, version)));
+        let (kernel, params) = match &rolled {
+            Some((_, rolled_header)) => (
+                Kernel::Pair,
+                work::kernel_params_pair(&header, rolled_header),
+            ),
+            None => (Kernel::Single, work::kernel_params(&header)),
+        };
         Arc::new(Self {
-            params: work::kernel_params(&header),
+            rolled,
+            kernel,
+            params,
             share_target: Target::from_difficulty(job.share_difficulty),
             network_target: job.network_target(),
             extranonce2,
@@ -54,35 +69,80 @@ pub fn run(shared: Arc<Shared>, client: Arc<Client>) {
     }
 }
 
-/// Checks the kernel against the genesis block: the GPU must find its nonce.
+/// Nonces one grid row covers with `kernel`.
+fn nonces_per_row(kernel: Kernel) -> u64 {
+    HASHES_PER_ROW / kernel.threads_per_nonce() as u64
+}
+
+fn genesis() -> [u8; 80] {
+    hex::decode(work::GENESIS_HEADER_HEX)
+        .expect("valid hex")
+        .try_into()
+        .expect("80 bytes")
+}
+
+/// Genesis with a version bit set: a header whose nonce is unknown.
+fn genesis_rolled() -> [u8; 80] {
+    let header = genesis();
+    let version = u32::from_le_bytes(header[0..4].try_into().unwrap());
+    work::with_version(&header, version | 1 << 13)
+}
+
+/// Checks both kernels against the genesis block: the GPU must find its
+/// nonce, in either lane of the paired kernel.
 pub fn self_test<T: Default>(gpu: &mut Gpu<T>) -> Result<()> {
-    let header: [u8; 80] = hex::decode(work::GENESIS_HEADER_HEX)?.try_into().unwrap();
-    let expected = u32::from_be_bytes(header[76..80].try_into().unwrap());
+    let (real, other) = (genesis(), genesis_rolled());
+    expect_genesis(gpu, Kernel::Single, work::kernel_params(&real), 0)?;
+    expect_genesis(
+        gpu,
+        Kernel::Pair,
+        work::kernel_params_pair(&real, &other),
+        0,
+    )?;
+    expect_genesis(
+        gpu,
+        Kernel::Pair,
+        work::kernel_params_pair(&other, &real),
+        1,
+    )
+}
+
+fn expect_genesis<T: Default>(
+    gpu: &mut Gpu<T>,
+    kernel: Kernel,
+    mut params: KernelParams,
+    lane: u32,
+) -> Result<()> {
+    let nonce = u32::from_be_bytes(genesis()[76..80].try_into().unwrap());
     let rows = 64;
-    let mut params = work::kernel_params(&header);
-    params.base = expected & !(rows * HASHES_PER_ROW as u32 - 1);
-    gpu.submit(&params, rows, T::default())?;
+    let span = rows as u64 * nonces_per_row(kernel);
+    params.base = nonce & !(span as u32 - 1);
+    gpu.submit(kernel, &params, rows, T::default())?;
     let batch = gpu.wait()?.expect("a dispatch was just queued");
+    let expected = Candidate { nonce, lane };
     if batch.candidates != [expected] {
         bail!(
-            "self-test failed: expected nonce {expected:08x}, GPU reported {:08x?}",
+            "self-test failed ({kernel:?} kernel): expected {expected:?}, GPU reported {:?}",
             batch.candidates
         );
     }
     Ok(())
 }
 
-/// Measures raw hashrate (H/s) on a fixed header.
-pub fn benchmark<T: Default>(gpu: &mut Gpu<T>, duration: Duration) -> Result<f64> {
-    let header: [u8; 80] = hex::decode(work::GENESIS_HEADER_HEX)?.try_into().unwrap();
-    let mut params = work::kernel_params(&header);
+/// Measures raw hashrate (H/s) of `kernel` on a fixed header.
+pub fn benchmark<T: Default>(gpu: &mut Gpu<T>, kernel: Kernel, duration: Duration) -> Result<f64> {
+    let mut params = match kernel {
+        Kernel::Single => work::kernel_params(&genesis()),
+        Kernel::Pair => work::kernel_params_pair(&genesis(), &genesis_rolled()),
+    };
     let rows = 1024;
+    let step = (rows as u64 * nonces_per_row(kernel)) as u32;
     let start = Instant::now();
     let mut hashes = 0u64;
     while start.elapsed() < duration {
         while gpu.has_capacity() {
-            gpu.submit(&params, rows, T::default())?;
-            params.base = params.base.wrapping_add(rows * HASHES_PER_ROW as u32);
+            gpu.submit(kernel, &params, rows, T::default())?;
+            params.base = params.base.wrapping_add(step);
         }
         hashes += gpu.wait()?.map_or(0, |batch| batch.hashes);
     }
@@ -96,7 +156,8 @@ fn mine(shared: &Shared, client: &Client) -> Result<()> {
     let mut gpu: Gpu<Tag> = Gpu::new()?;
     shared.details().gpu_name = gpu.name().to_string();
     self_test(&mut gpu)?;
-    let hashrate = benchmark(&mut gpu, STARTUP_BENCHMARK)?;
+    // Most pools allow version rolling, so measure the paired kernel.
+    let hashrate = benchmark(&mut gpu, Kernel::Pair, STARTUP_BENCHMARK)?;
     shared.log(
         Level::Good,
         format!(
@@ -149,13 +210,19 @@ fn mine(shared: &Shared, client: &Client) -> Result<()> {
                 let Some(current_unit) = unit.clone() else {
                     break;
                 };
-                let rows_now = rows.min((NONCE_SPACE - offset) / HASHES_PER_ROW) as u32;
+                let per_row = nonces_per_row(current_unit.kernel);
+                let rows_now = rows.min((NONCE_SPACE - offset) / per_row) as u32;
                 let params = KernelParams {
                     base: offset as u32,
                     ..current_unit.params
                 };
-                gpu.submit(&params, rows_now, Some(current_unit.clone()))?;
-                offset += rows_now as u64 * HASHES_PER_ROW;
+                gpu.submit(
+                    current_unit.kernel,
+                    &params,
+                    rows_now,
+                    Some(current_unit.clone()),
+                )?;
+                offset += rows_now as u64 * per_row;
                 if offset >= NONCE_SPACE {
                     // Every nonce tried: change the coinbase to get a fresh header.
                     counter += 1;
@@ -191,15 +258,32 @@ fn mine(shared: &Shared, client: &Client) -> Result<()> {
 fn finish(shared: &Shared, client: &Client, batch: Batch<Tag>, live_job: Option<&Arc<Job>>) {
     shared.hashes.fetch_add(batch.hashes, Ordering::Relaxed);
     if let Some(source) = &batch.tag {
-        for &word in &batch.candidates {
-            check(shared, client, source, word, live_job);
+        for &candidate in &batch.candidates {
+            check(shared, client, source, candidate, live_job);
         }
     }
 }
 
 /// Verifies a GPU candidate on the CPU and submits it if the pool wants it.
-fn check(shared: &Shared, client: &Client, unit: &Unit, word: u32, live_job: Option<&Arc<Job>>) {
-    let mut header = unit.header;
+fn check(
+    shared: &Shared,
+    client: &Client,
+    unit: &Unit,
+    candidate: Candidate,
+    live_job: Option<&Arc<Job>>,
+) {
+    let word = candidate.nonce;
+    let (mut header, version_bits) = match (candidate.lane, &unit.rolled) {
+        (0, _) => (unit.header, None),
+        (1, Some((bits, rolled))) => (*rolled, Some(*bits)),
+        _ => {
+            shared.log(
+                Level::Error,
+                format!("GPU reported an impossible lane ({candidate:?})"),
+            );
+            return;
+        }
+    };
     work::set_nonce_word(&mut header, word);
     let hash = sha256d(&header);
     if hash[28..] != [0; 4] {
@@ -246,6 +330,7 @@ fn check(shared: &Shared, client: &Client, unit: &Unit, word: u32, live_job: Opt
             extranonce2: hex::encode(&unit.extranonce2),
             ntime: format!("{:08x}", job.ntime),
             nonce: work::nonce_hex(word),
+            version_bits,
             difficulty,
             is_block,
         },

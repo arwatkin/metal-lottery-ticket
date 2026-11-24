@@ -96,10 +96,15 @@ fn run_benchmark(duration: Duration) -> Result<()> {
     let mut gpu = gpu::Gpu::<()>::new()?;
     println!("GPU        {}", gpu.name());
     miner::self_test(&mut gpu)?;
-    println!("Self-test  passed (found the genesis block nonce)");
-    println!("Hashing for {} s ...", duration.as_secs());
-    let hashrate = miner::benchmark(&mut gpu, duration)?;
-    println!("Hashrate   {}", ui::format::hashrate(hashrate));
+    println!("Self-test  passed (found the genesis block nonce in every kernel lane)");
+    println!("Hashing for {} s per kernel ...", duration.as_secs());
+    let single = miner::benchmark(&mut gpu, gpu::Kernel::Single, duration)?;
+    println!("Hashrate   {}  (single lane)", ui::format::hashrate(single));
+    let pair = miner::benchmark(&mut gpu, gpu::Kernel::Pair, duration)?;
+    println!(
+        "Hashrate   {}  (paired lanes, used when the pool allows version rolling)",
+        ui::format::hashrate(pair)
+    );
     Ok(())
 }
 

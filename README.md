@@ -76,7 +76,7 @@ pools refuse to authorize an invalid one and the miner will stop and say so.
 
 | Option                  | Effect                                                    |
 | ----------------------- | --------------------------------------------------------- |
-| `--benchmark [SECONDS]` | Measure hashrate (10 s by default) and exit.              |
+| `--benchmark [SECONDS]` | Measure each kernel's hashrate (10 s each) and exit.      |
 | `--headless`            | Print log lines instead of drawing the dashboard.         |
 | `--help`, `--version`   | The usual.                                                |
 
@@ -111,7 +111,8 @@ Headless mode is chosen automatically when the output is not a terminal, so
 A Bitcoin block header is 80 bytes and is hashed as `SHA256(SHA256(header))`.
 Mining means changing the 4-byte nonce at the end of the header until that hash,
 read as a number, falls below the network target. When all 2³² nonces are used
-up (about every 4.6 seconds on an M1 Max) the miner changes the `extranonce2`
+up (about every 9 seconds on an M1 Max, which tries each nonce under two header
+versions when the pool allows it) the miner changes the `extranonce2`
 field inside the coinbase transaction, which changes the merkle root and gives a
 fresh header to search.
 
@@ -127,7 +128,7 @@ fresh header to search.
 
 ### The kernel
 
-Each GPU thread tests one nonce. A full double hash is three SHA-256
+Each GPU thread computes one double hash. A full double hash is three SHA-256
 compressions (192 rounds); the kernel computes about 121 of them:
 
 - **Midstate.** The first 64 header bytes do not contain the nonce, so their
@@ -141,19 +142,26 @@ compressions (192 rounds); the kernel computes about 121 of them:
 - **Early exit.** A hash can only meet difficulty 1 if its last 32-bit word is
   zero, and that word is fixed four rounds before the end, so the final three
   rounds are never computed.
+- **Paired lanes.** If the pool allows version rolling (BIP 310/320, which most
+  pools do), neighbouring GPU threads hash the same nonce under two header
+  versions. The version only affects the first block, so both threads need the
+  same message schedule for the second; each computes every other word and
+  they swap results through the SIMD shuffle network. That saves about 4%.
+  Without version rolling the miner uses a one-thread-per-nonce kernel.
 
 Nonces that pass this 32-bit test (about one in 4.3 billion) are returned to the
 CPU, which recomputes the full hash and compares it with the pool and network
 targets. Two dispatches are kept queued so the GPU never waits for the CPU.
 
-At start-up the kernel must find the nonce of the genesis block, so a
-miscompiled or misbehaving GPU is caught before any mining starts.
+At start-up both kernels must find the nonce of the genesis block (the paired
+one in either lane), so a miscompiled or misbehaving GPU is caught before any
+mining starts.
 
 ### Performance
 
-| Machine              | Hashrate    |
-| -------------------- | ----------- |
-| M1 Max (32-core GPU) | ~925 MH/s   |
+| Machine              | Single lane | Paired lanes |
+| -------------------- | ----------- | ------------ |
+| M1 Max (32-core GPU) | ~920 MH/s   | ~960 MH/s    |
 
 Numbers for other chips are welcome — run `--benchmark` and open a pull request.
 
@@ -169,7 +177,6 @@ The tests cover the CPU side. `--benchmark` runs the GPU self-test.
 ## Limitations
 
 - Stratum v1 over plain TCP only: no TLS, no Stratum v2, no `getblocktemplate`.
-- No version rolling (ASICBoost). It would not make a GPU faster.
 - Uses the system's default Metal device; there is no multi-GPU support.
 
 ## License
