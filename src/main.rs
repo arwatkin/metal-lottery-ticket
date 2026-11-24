@@ -93,9 +93,9 @@ fn parse_args() -> Result<Option<Mode>> {
 }
 
 fn run_benchmark(duration: Duration) -> Result<()> {
-    let mut gpu = gpu::Gpu::<()>::new()?;
+    let mut gpu = miner::open_tested_gpu::<()>()?;
     println!("GPU        {}", gpu.name());
-    miner::self_test(&mut gpu)?;
+    println!("Kernels    {}", gpu.codegen());
     println!("Self-test  passed (found the genesis block nonce in every kernel lane)");
     println!("Hashing for {} s per kernel ...", duration.as_secs());
     let single = miner::benchmark(&mut gpu, gpu::Kernel::Single, duration)?;
@@ -165,6 +165,17 @@ fn run_miner(headless: bool) -> Result<()> {
 }
 
 fn main() -> ExitCode {
+    // Internal: the kernel compiler child process (see gpu::patched_pipelines).
+    let args: Vec<String> = std::env::args().collect();
+    if args.len() == 3 && args[1] == gpu::EMIT_ARCHIVE_FLAG {
+        return match gpu::emit_compiled_archive(std::path::Path::new(&args[2])) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => {
+                eprintln!("{error:#}");
+                ExitCode::FAILURE
+            }
+        };
+    }
     let outcome = match parse_args() {
         Ok(None) => Ok(()),
         Ok(Some(Mode::Benchmark(duration))) => run_benchmark(duration),

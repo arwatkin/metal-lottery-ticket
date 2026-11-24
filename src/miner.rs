@@ -1,6 +1,6 @@
 //! The mining loop: feeds work to the GPU and checks what comes back.
 
-use crate::gpu::{Batch, Candidate, Gpu, HASHES_PER_ROW, Kernel, KernelParams};
+use crate::gpu::{Batch, Candidate, Codegen, Gpu, HASHES_PER_ROW, Kernel, KernelParams};
 use crate::sha256::sha256d;
 use crate::state::{Level, Shared};
 use crate::stratum::{Client, Share};
@@ -88,6 +88,25 @@ fn genesis_rolled() -> [u8; 80] {
     work::with_version(&header, version | 1 << 13)
 }
 
+/// Opens the GPU and checks its kernels with [`self_test`]. Hand-patched
+/// kernels that fail it are replaced by the compiler's unpatched ones, which
+/// must then pass.
+pub fn open_tested_gpu<T: Default>() -> Result<Gpu<T>> {
+    let mut gpu = Gpu::new()?;
+    match self_test(&mut gpu) {
+        Ok(()) => Ok(gpu),
+        Err(error) if gpu.codegen().is_patched() => {
+            drop(gpu);
+            let mut plain = Gpu::open(Some(format!(
+                "patched kernels failed the self-test: {error:#}"
+            )))?;
+            self_test(&mut plain)?;
+            Ok(plain)
+        }
+        Err(error) => Err(error),
+    }
+}
+
 /// Checks both kernels against the genesis block: the GPU must find its
 /// nonce, in either lane of the paired kernel.
 pub fn self_test<T: Default>(gpu: &mut Gpu<T>) -> Result<()> {
@@ -153,16 +172,26 @@ pub fn benchmark<T: Default>(gpu: &mut Gpu<T>, kernel: Kernel, duration: Duratio
 }
 
 fn mine(shared: &Shared, client: &Client) -> Result<()> {
-    let mut gpu: Gpu<Tag> = Gpu::new()?;
+    let mut gpu: Gpu<Tag> = open_tested_gpu()?;
     shared.details().gpu_name = gpu.name().to_string();
-    self_test(&mut gpu)?;
+    if let Codegen::Compiler(reason) = gpu.codegen() {
+        shared.log(
+            Level::Warn,
+            format!("Using unpatched GPU kernels  ·  {reason}"),
+        );
+    }
     // Most pools allow version rolling, so measure the paired kernel.
     let hashrate = benchmark(&mut gpu, Kernel::Pair, STARTUP_BENCHMARK)?;
     shared.log(
         Level::Good,
         format!(
-            "{} ready  ·  self-test passed  ·  {}",
+            "{} ready  ·  self-test passed  ·  {} kernels  ·  {}",
             gpu.name(),
+            if gpu.codegen().is_patched() {
+                "hand-patched"
+            } else {
+                "compiler"
+            },
             format::hashrate(hashrate)
         ),
     );

@@ -172,8 +172,30 @@ struct Results {{
     .unwrap();
     kernel_body(&mut s, Kernel::Single);
     kernel_body(&mut s, Kernel::Pair);
+    write!(
+        s,
+        r#"
+// Liveness check for the post-compilation patch (see gpu::patch): the patch
+// rewrites this XOR's 8-bit immediate, so the result shows whose machine code
+// ran. The thread index keeps the XOR in per-thread code.
+kernel void {CANARY_ENTRY}(device uint* io [[buffer(0)]],
+                   uint tid [[thread_position_in_grid]])
+{{
+    io[tid + 1] = io[tid] ^ 0x{CANARY:02x}u;
+}}
+"#
+    )
+    .unwrap();
     s
 }
+
+/// Entry point of the canary kernel.
+pub const CANARY_ENTRY: &str = "canary";
+
+/// The constant the canary kernel XORs in, small enough to be an inline
+/// immediate. [`super::patch`] replaces it with [`CANARY_PATCHED`].
+pub const CANARY: u32 = 0xa5;
+pub const CANARY_PATCHED: u32 = 0x5a;
 
 /// Appends one kernel function.
 #[allow(clippy::needless_range_loop)] // rounds are indexed by number throughout

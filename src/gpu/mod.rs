@@ -1,21 +1,32 @@
 //! Metal compute backend.
 //!
-//! Owns the device, the compiled search pipeline and a small ring of
+//! Owns the device, the compiled search pipelines and a small ring of
 //! parameter/result buffers so several dispatches can be queued at once and the
 //! GPU never idles while the CPU inspects the previous batch.
+//!
+//! The pipelines normally run the compiler's machine code with one fix-up
+//! applied ([`patch`]); if that cannot be done safely they run it unchanged.
 
+mod agx;
+#[rustfmt::skip]
+mod agx_table;
 pub mod kernel;
+mod patch;
 
 use anyhow::{Context, Result, anyhow, bail};
 use objc2::rc::{Retained, autoreleasepool};
 use objc2::runtime::ProtocolObject;
-use objc2_foundation::NSString;
+use objc2_foundation::{NSArray, NSError, NSString, NSURL};
 use objc2_metal::{
-    MTLBuffer, MTLCommandBuffer, MTLCommandBufferStatus, MTLCommandEncoder, MTLCommandQueue,
-    MTLCompileOptions, MTLComputeCommandEncoder, MTLComputePipelineState,
-    MTLCreateSystemDefaultDevice, MTLDevice, MTLLibrary, MTLResourceOptions, MTLSize,
+    MTLBinaryArchive, MTLBinaryArchiveDescriptor, MTLBuffer, MTLCommandBuffer,
+    MTLCommandBufferStatus, MTLCommandEncoder, MTLCommandQueue, MTLCompileOptions,
+    MTLComputeCommandEncoder, MTLComputePipelineDescriptor, MTLComputePipelineState,
+    MTLCreateSystemDefaultDevice, MTLDevice, MTLFunction, MTLLibrary, MTLPipelineOption,
+    MTLResourceOptions, MTLSize,
 };
 use std::collections::VecDeque;
+use std::fmt;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicU32, Ordering};
 
 pub use kernel::Kernel;
@@ -73,9 +84,40 @@ pub struct Candidate {
 }
 
 type Buffer = Retained<ProtocolObject<dyn MTLBuffer>>;
+type Device = Retained<ProtocolObject<dyn MTLDevice>>;
+type Function = Retained<ProtocolObject<dyn MTLFunction>>;
+type PipelineState = Retained<ProtocolObject<dyn MTLComputePipelineState>>;
+
+/// Which machine code the kernels run.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Codegen {
+    /// The compiler's code with its rotate register copies removed.
+    Patched(patch::Stats),
+    /// The compiler's code as is, and why it was not patched.
+    Compiler(String),
+}
+
+impl Codegen {
+    pub fn is_patched(&self) -> bool {
+        matches!(self, Codegen::Patched(_))
+    }
+}
+
+impl fmt::Display for Codegen {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Codegen::Patched(stats) => write!(
+                f,
+                "hand-patched ({} register copies removed)",
+                stats.copies_removed
+            ),
+            Codegen::Compiler(reason) => write!(f, "compiler output ({reason})"),
+        }
+    }
+}
 
 struct Pipeline {
-    state: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
+    state: PipelineState,
     /// Largest power-of-two threadgroup the pipeline supports, capped at the
     /// grid width so the grid is always a whole number of groups wide.
     group_width: usize,
@@ -106,40 +148,256 @@ pub struct Gpu<T> {
     name: String,
     queue: Retained<ProtocolObject<dyn MTLCommandQueue>>,
     pipelines: [Pipeline; 2],
+    codegen: Codegen,
     free: Vec<Slot>,
     in_flight: VecDeque<InFlight<T>>,
 }
 
+fn ns_error(error: Retained<NSError>) -> anyhow::Error {
+    anyhow!("{}", error.localizedDescription())
+}
+
+/// A file in the temporary directory, deleted on drop.
+struct TempFile(PathBuf);
+
+impl TempFile {
+    fn new(tag: &str) -> Self {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos());
+        let name = format!(
+            "bitcoin_miner-{}-{nanos}-{tag}.metallib",
+            std::process::id()
+        );
+        TempFile(std::env::temp_dir().join(name))
+    }
+
+    fn url(&self) -> Retained<NSURL> {
+        NSURL::fileURLWithPath(&NSString::from_str(&self.0.to_string_lossy()))
+    }
+}
+
+impl Drop for TempFile {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
+/// Pipelines straight from the compiler.
+fn compiled_pipelines(device: &Device, functions: &[Function; 2]) -> Result<[PipelineState; 2]> {
+    let build = |function: &Function| {
+        device
+            .newComputePipelineStateWithFunction_error(function)
+            .map_err(|e| anyhow!("pipeline creation failed: {}", e.localizedDescription()))
+    };
+    Ok([build(&functions[0])?, build(&functions[1])?])
+}
+
+/// Hidden command-line flag: compile the kernels into a binary archive at the
+/// given path and exit. See [`patched_pipelines`] for why this runs in a
+/// separate process.
+pub const EMIT_ARCHIVE_FLAG: &str = "--emit-kernel-archive";
+
+fn compile_library(device: &Device) -> Result<Retained<ProtocolObject<dyn MTLLibrary>>> {
+    let source = NSString::from_str(&kernel::source());
+    device
+        .newLibraryWithSource_options_error(&source, Some(&MTLCompileOptions::new()))
+        .map_err(|e| anyhow!("kernel compilation failed: {}", e.localizedDescription()))
+}
+
+fn function(library: &ProtocolObject<dyn MTLLibrary>, entry: &str) -> Result<Function> {
+    library
+        .newFunctionWithName(&NSString::from_str(entry))
+        .with_context(|| format!("kernel entry point `{entry}` missing"))
+}
+
+fn pipeline_descriptor(function: &Function) -> Retained<MTLComputePipelineDescriptor> {
+    let d = MTLComputePipelineDescriptor::new();
+    d.setComputeFunction(Some(function));
+    d
+}
+
+/// Entry points stored in the archive: both search kernels, then the canary.
+fn archive_entries() -> [&'static str; 3] {
+    [
+        Kernel::Single.entry_point(),
+        Kernel::Pair.entry_point(),
+        kernel::CANARY_ENTRY,
+    ]
+}
+
+/// Body of [`EMIT_ARCHIVE_FLAG`]: compiles every kernel into a binary archive.
+pub fn emit_compiled_archive(path: &std::path::Path) -> Result<()> {
+    let device = MTLCreateSystemDefaultDevice().context("no Metal device found")?;
+    let library = compile_library(&device)?;
+    let archive = device
+        .newBinaryArchiveWithDescriptor_error(&MTLBinaryArchiveDescriptor::new())
+        .map_err(ns_error)
+        .context("creating a binary archive")?;
+    for entry in archive_entries() {
+        archive
+            .addComputePipelineFunctionsWithDescriptor_error(&pipeline_descriptor(&function(
+                &library, entry,
+            )?))
+            .map_err(ns_error)
+            .context("adding a pipeline to the archive")?;
+    }
+    let url = NSURL::fileURLWithPath(&NSString::from_str(&path.to_string_lossy()));
+    archive
+        .serializeToURL_error(&url)
+        .map_err(ns_error)
+        .context("serialising the archive")
+}
+
+/// Pipelines running the compiler's code after [`patch::patch_archive`].
+///
+/// The compiled archive comes from a child process: once a process has
+/// compiled a pipeline, Metal answers later requests for the same function
+/// from its in-memory cache, even when told to use a binary archive, so
+/// compiling here would silently bring back the unpatched code. The canary
+/// kernel then proves which code actually runs.
+fn patched_pipelines(
+    device: &Device,
+    queue: &ProtocolObject<dyn MTLCommandQueue>,
+    library: &ProtocolObject<dyn MTLLibrary>,
+) -> Result<([PipelineState; 2], patch::Stats)> {
+    let original = TempFile::new("compiled");
+    let exe = std::env::current_exe().context("locating the miner executable")?;
+    let child = std::process::Command::new(exe)
+        .arg(EMIT_ARCHIVE_FLAG)
+        .arg(&original.0)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .output()
+        .context("starting the kernel compiler process")?;
+    if !child.status.success() {
+        bail!(
+            "kernel compiler process failed: {}",
+            String::from_utf8_lossy(&child.stderr).trim()
+        );
+    }
+    let mut bytes = std::fs::read(&original.0).context("reading the compiled archive")?;
+
+    let stats = patch::patch_archive(&mut bytes)?;
+
+    let patched = TempFile::new("patched");
+    std::fs::write(&patched.0, &bytes).context("writing the patched archive")?;
+    let archive_descriptor = MTLBinaryArchiveDescriptor::new();
+    archive_descriptor.setUrl(Some(&patched.url()));
+    let archive = device
+        .newBinaryArchiveWithDescriptor_error(&archive_descriptor)
+        .map_err(ns_error)
+        .context("loading the patched archive")?;
+    let archives = NSArray::from_retained_slice(&[archive]);
+    let build = |entry: &str| -> Result<PipelineState> {
+        let d = pipeline_descriptor(&function(library, entry)?);
+        d.setBinaryArchives(Some(&archives));
+        device
+            .newComputePipelineStateWithDescriptor_options_reflection_error(
+                &d,
+                MTLPipelineOption::FailOnBinaryArchiveMiss,
+                None,
+            )
+            .map_err(ns_error)
+            .context("building a pipeline from the patched archive")
+    };
+    let [single, pair, canary] = archive_entries();
+    check_canary(device, queue, &build(canary)?)?;
+    Ok(([build(single)?, build(pair)?], stats))
+}
+
+/// Runs the canary kernel: `io[1] = io[0] ^ constant`, where the patch
+/// replaced the constant. Errors unless the patched constant was used.
+fn check_canary(
+    device: &Device,
+    queue: &ProtocolObject<dyn MTLCommandQueue>,
+    state: &PipelineState,
+) -> Result<()> {
+    let buffer = device
+        .newBufferWithLength_options(8, MTLResourceOptions::StorageModeShared)
+        .context("failed to allocate a Metal buffer")?;
+    // SAFETY: an 8-byte CPU-visible buffer that no GPU work is using yet.
+    unsafe { buffer.contents().cast::<[u32; 2]>().write([7, 0]) };
+    autoreleasepool(|_| -> Result<()> {
+        let command = queue
+            .commandBuffer()
+            .context("failed to create a command buffer")?;
+        let encoder = command
+            .computeCommandEncoder()
+            .context("failed to create a compute encoder")?;
+        encoder.setComputePipelineState(state);
+        // SAFETY: index 0 matches the canary's signature; `buffer` outlives the wait.
+        unsafe { encoder.setBuffer_offset_atIndex(Some(&buffer), 0, 0) };
+        let one = MTLSize {
+            width: 1,
+            height: 1,
+            depth: 1,
+        };
+        encoder.dispatchThreadgroups_threadsPerThreadgroup(one, one);
+        encoder.endEncoding();
+        command.commit();
+        command.waitUntilCompleted();
+        if command.status() == MTLCommandBufferStatus::Error {
+            bail!("canary dispatch failed");
+        }
+        Ok(())
+    })?;
+    // SAFETY: the dispatch has completed.
+    let out = unsafe { buffer.contents().cast::<[u32; 2]>().read() }[1];
+    if out == 7 ^ kernel::CANARY_PATCHED {
+        Ok(())
+    } else if out == 7 ^ kernel::CANARY {
+        bail!("Metal ran the unpatched code instead of the patched archive")
+    } else {
+        bail!("canary kernel returned {out:#x}")
+    }
+}
+
 impl<T> Gpu<T> {
-    /// Opens the default Metal device and compiles the search kernel.
+    /// Opens the default Metal device and compiles the search kernels,
+    /// patched unless `KERNEL_PATCH=off` is set.
     pub fn new() -> Result<Self> {
+        let off = std::env::var("KERNEL_PATCH").is_ok_and(|v| v.eq_ignore_ascii_case("off"));
+        Self::open(off.then(|| "patch disabled by KERNEL_PATCH=off".to_string()))
+    }
+
+    /// Opens the default Metal device and compiles the search kernels. With
+    /// `skip_patch`, the compiler's code runs unchanged for the reason given.
+    pub fn open(skip_patch: Option<String>) -> Result<Self> {
         let device = MTLCreateSystemDefaultDevice()
             .context("no Metal device found - this miner needs an Apple Silicon GPU")?;
         let name = device.name().to_string();
 
-        let options = MTLCompileOptions::new();
-        let source = NSString::from_str(&kernel::source());
-        let library = device
-            .newLibraryWithSource_options_error(&source, Some(&options))
-            .map_err(|e| anyhow!("kernel compilation failed: {}", e.localizedDescription()))?;
-        let pipeline = |kernel: Kernel| -> Result<Pipeline> {
-            let entry = kernel.entry_point();
-            let function = library
-                .newFunctionWithName(&NSString::from_str(entry))
-                .with_context(|| format!("kernel entry point `{entry}` missing"))?;
-            let state = device
-                .newComputePipelineStateWithFunction_error(&function)
-                .map_err(|e| anyhow!("pipeline creation failed: {}", e.localizedDescription()))?;
-            let max_group = state.maxTotalThreadsPerThreadgroup().max(1);
-            // Paired lanes must share a SIMD group, so groups must be even.
-            let group_width = (1usize << max_group.ilog2()).clamp(2, 1 << GRID_SHIFT);
-            Ok(Pipeline { state, group_width })
-        };
-        let pipelines = [pipeline(Kernel::Single)?, pipeline(Kernel::Pair)?];
+        let library = compile_library(&device)?;
         let queue = device
             .newCommandQueue()
             .context("failed to create a Metal command queue")?;
-
+        let compiled = || -> Result<[PipelineState; 2]> {
+            compiled_pipelines(
+                &device,
+                &[
+                    function(&library, Kernel::Single.entry_point())?,
+                    function(&library, Kernel::Pair.entry_point())?,
+                ],
+            )
+        };
+        let (states, codegen) = match skip_patch {
+            Some(reason) => (compiled()?, Codegen::Compiler(reason)),
+            None => match patched_pipelines(&device, &queue, &library) {
+                Ok((states, stats)) => (states, Codegen::Patched(stats)),
+                Err(error) => (
+                    compiled()?,
+                    Codegen::Compiler(format!("patch skipped: {error:#}")),
+                ),
+            },
+        };
+        let pipelines = states.map(|state| {
+            let max_group = state.maxTotalThreadsPerThreadgroup().max(1);
+            // Paired lanes must share a SIMD group, so groups must be even.
+            let group_width = (1usize << max_group.ilog2()).clamp(2, 1 << GRID_SHIFT);
+            Pipeline { state, group_width }
+        });
         let mut free = Vec::with_capacity(QUEUE_DEPTH);
         for _ in 0..QUEUE_DEPTH {
             let alloc = |len: usize| {
@@ -157,6 +415,7 @@ impl<T> Gpu<T> {
             name,
             queue,
             pipelines,
+            codegen,
             free,
             in_flight: VecDeque::new(),
         })
@@ -164,6 +423,11 @@ impl<T> Gpu<T> {
 
     pub fn name(&self) -> &str {
         &self.name
+    }
+
+    /// Which machine code the kernels run.
+    pub fn codegen(&self) -> &Codegen {
+        &self.codegen
     }
 
     /// True if another dispatch can be queued without waiting.

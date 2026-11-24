@@ -10,7 +10,7 @@ in a `.env` file.
 
 As an investment, no. As a lottery ticket, absolutely.
 
-The honest maths: an M1 Max does roughly 0.9 GH/s, and the Bitcoin network does
+The honest maths: an M1 Max does roughly 1 GH/s, and the Bitcoin network does
 about a trillion times that. On average you'd find a block about once every
 twenty million years, and the electricity will cost more than you can expect to
 earn. The dashboard shows your live odds, so nothing is hidden.
@@ -62,6 +62,7 @@ environment variables work too). Only the address is required.
 | `WORKER`        | —                      | Optional name for this machine on the pool's dashboard.    |
 | `POOL_PASSWORD` | `x`                    | Pool password. Almost every pool ignores it.               |
 | `INTENSITY`     | `100`                  | Percentage of time the GPU spends hashing (1–100).         |
+| `KERNEL_PATCH`  | `on`                   | `off` runs the compiler's GPU code unpatched (see below).  |
 
 The default pool is a **solo** pool: you only earn something if you find a
 block yourself, and then you keep the whole reward minus the pool's fee. Any
@@ -111,14 +112,14 @@ Headless mode is chosen automatically when the output is not a terminal, so
 A Bitcoin block header is 80 bytes and is hashed as `SHA256(SHA256(header))`.
 Mining means changing the 4-byte nonce at the end of the header until that hash,
 read as a number, falls below the network target. When all 2³² nonces are used
-up (about every 9 seconds on an M1 Max, which tries each nonce under two header
+up (about every 8 seconds on an M1 Max, which tries each nonce under two header
 versions when the pool allows it) the miner changes the `extranonce2`
 field inside the coinbase transaction, which changes the merkle root and gives a
 fresh header to search.
 
 | Module            | Role                                                                    |
 | ----------------- | ----------------------------------------------------------------------- |
-| `src/gpu/`        | Metal backend and the SHA-256d search kernel (generated MSL)            |
+| `src/gpu/`        | Metal backend, the SHA-256d search kernel (generated MSL), its patcher  |
 | `src/work.rs`     | Header assembly, targets, per-header precomputation                     |
 | `src/stratum.rs`  | Stratum v1 client with reconnect and backoff                            |
 | `src/miner.rs`    | Feeds the GPU, verifies candidates on the CPU, submits shares           |
@@ -157,6 +158,32 @@ Nonces that pass this 32-bit test (about one in 4.3 billion) are returned to the
 CPU, which recomputes the full hash and compares it with the pool and network
 targets. Two dispatches are kept queued so the GPU never waits for the CPU.
 
+### Patching the compiled code
+
+Apple's shader compiler turns each rotate into an `extr` (extract from a register
+pair) and, before rotating a value, copies it into a second register so the
+instruction never reads the same register twice. The GPU does not need that:
+`extr` reading one register twice is a correct rotate. In a kernel limited by
+how many instructions it can issue, those ~650 copies per hash cost about 5%.
+
+So at start-up the miner has a child process compile the kernels into a Metal
+binary archive, removes the copies from the GPU machine code itself, and builds
+its pipelines from the patched archive. The patcher (`src/gpu/patch.rs`) only
+touches code it fully understands:
+
+- every instruction must decode to a known encoding (a table generated from
+  [applegpu](https://github.com/dougallj/applegpu), Dougall Johnson's
+  reverse-engineered description of the M1 GPU) and be one these kernels use;
+- a copy is removed only if every later read of it is the second source of a
+  rotate of the same register, and nothing in between is unmodelled;
+- a tiny canary kernel, patched too, proves Metal is running the patched code
+  rather than a cached compile.
+
+If any of that fails, or the patched kernels fail the self-test below, the miner
+uses the compiler's code unchanged and says why. `KERNEL_PATCH=off` forces that.
+Since it relies on undocumented details of Apple's GPU, a future macOS may well
+make the patch stop applying; mining continues either way.
+
 At start-up both kernels must find the nonce of the genesis block (the paired
 one in either lane), so a miscompiled or misbehaving GPU is caught before any
 mining starts.
@@ -165,7 +192,7 @@ mining starts.
 
 | Machine              | Single lane | Paired lanes |
 | -------------------- | ----------- | ------------ |
-| M1 Max (32-core GPU) | ~945 MH/s   | ~990 MH/s    |
+| M1 Max (32-core GPU) | ~998 MH/s   | ~1.05 GH/s   |
 
 Numbers for other chips are welcome — run `--benchmark` and open a pull request.
 
@@ -174,6 +201,7 @@ Numbers for other chips are welcome — run `--benchmark` and open a pull reques
 ```sh
 cargo test      # SHA-256 vectors, header assembly against real blocks, layout tests
 cargo clippy --all-targets
+python3 -I tools/gen_agx_table.py PATH_TO_APPLEGPU > src/gpu/agx_table.rs  # regenerate
 ```
 
 The tests cover the CPU side. `--benchmark` runs the GPU self-test.
@@ -185,4 +213,7 @@ The tests cover the CPU side. `--benchmark` runs the GPU self-test.
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
+MIT — see [LICENSE](LICENSE). `src/gpu/agx_table.rs` and the instruction
+layouts in `src/gpu/agx.rs` are derived from
+[applegpu](https://github.com/dougallj/applegpu) (BSD-3-Clause, Dougall
+Johnson); its licence is reproduced in that file.

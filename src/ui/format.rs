@@ -13,7 +13,13 @@ pub fn hashrate_parts(rate: f64) -> (String, &'static str) {
         value /= 1000.0;
         unit += 1;
     }
-    let digits = if unit == 0 { 0 } else { 1 };
+    // Four significant figures once scaled: 1.043 GH/s, 81.23 MH/s, 923.4 MH/s.
+    let digits = match value {
+        _ if unit == 0 => 0,
+        v if v < 9.9995 => 3,
+        v if v < 99.995 => 2,
+        _ => 1,
+    };
     (format!("{value:.digits$}"), UNITS[unit])
 }
 
@@ -142,7 +148,9 @@ mod tests {
         assert_eq!(hashrate(0.0), "0 H/s");
         assert_eq!(hashrate(950.0), "950 H/s");
         assert_eq!(hashrate(923_400_000.0), "923.4 MH/s");
-        assert_eq!(hashrate(999_990_000.0), "1.0 GH/s");
+        assert_eq!(hashrate(999_990_000.0), "1.000 GH/s");
+        assert_eq!(hashrate(1_043_200_000.0), "1.043 GH/s");
+        assert_eq!(hashrate(81_234_567.0), "81.23 MH/s");
         assert_eq!(hashrate(8.1e20), "810.0 EH/s");
     }
 
